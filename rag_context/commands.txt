@@ -1,0 +1,67 @@
+open psql: psql "postgresql://rag_user:rag_pass@localhost:5432/rag_db"
+
+cases:
+rag_db=# CREATE TABLE cases (
+    case_id TEXT PRIMARY KEY,
+    docket_number TEXT,
+    judges TEXT[],
+
+    case_type TEXT,
+    procedural_posture TEXT,
+    decision_date DATE,
+
+    disposition_label TEXT,
+    complexity_label TEXT,
+
+    oral_argument_minutes INTEGER,
+    argued_flag BOOLEAN,
+
+    ingest_version TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+documents:
+CREATE TABLE documents (
+    doc_id TEXT PRIMARY KEY,
+    case_id TEXT REFERENCES cases(case_id) ON DELETE CASCADE,
+
+    doc_type TEXT,
+    text_clean TEXT,
+
+    page_count INTEGER,
+    token_count INTEGER,
+
+    source_url TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+chunks:
+CREATE TABLE chunks (
+    chunk_id TEXT PRIMARY KEY,
+    case_id TEXT REFERENCES cases(case_id) ON DELETE CASCADE,
+    doc_id TEXT REFERENCES documents(doc_id) ON DELETE CASCADE,
+
+    section_type TEXT,
+    heading_path TEXT,
+    chunk_text TEXT,
+
+    token_count INTEGER,
+
+    embedding VECTOR(1536),
+
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+case cards:
+CREATE TABLE case_cards (
+    case_id TEXT PRIMARY KEY REFERENCES cases(case_id) ON DELETE CASCADE,
+
+    case_card_text TEXT,
+    issue_tags TEXT[],
+    statute_tags TEXT[],
+    doctrine_tags TEXT[],
+
+    generated_by_model TEXT,
+    generated_at TIMESTAMP DEFAULT NOW()
+);
+

@@ -1,0 +1,3 @@
+Basically using a vector database and creating case ids, or fingerprints, as our database
+
+Using a vector database and cosine similarity to find top-k similar cases to current 
