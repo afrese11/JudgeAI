@@ -1,3 +1,84 @@
 Basically using a vector database and creating case ids, or fingerprints, as our database
 
-Using a vector database and cosine similarity to find top-k similar cases to current 
+Using a vector database and cosine similarity to find top-k similar cases to currently inspected open
+    - pgvector extension allows for fast search
+    - allows for VECTOR column type
+
+
+**AT QUERY TIME**:
+    - we first search over case_cards to find relevant cases
+    - we then search over chunks to find SPECIFIC chunks of data to feed our model
+
+**CASES TABLE:**
+    One row per appellate case.
+    What it stores:
+
+    identifiers (case_id, docket number, court)
+
+    labels/targets you care about predicting or analyzing (disposition_label, complexity_label)
+
+    structured metadata that’s useful for filtering or features (case_type, oral argument minutes, argued_flag, dates, posture)
+
+    Why it matters:
+
+    retrieval often happens at the chunk level, but you want to return results at the case level → this table is the hub.
+
+**DOCUMENTS TABLE:**
+    One row per source document within a case (e.g., appellant brief, appellee brief, addendum, reply).
+
+    What it stores:
+
+    document identity + relationship to case (doc_id, case_id)
+
+    document category (doc_type)
+
+    cleaned text (text_clean)
+
+    basic stats (pages/tokens) and provenance (source_url)
+
+    Why it matters:
+
+    lets you manage multiple briefs per case cleanly
+
+    helps debugging ingestion (“what text did we embed?”)
+
+    gives you a place to store full cleaned text even if you embed only chunks
+
+**CHUNKS TABLE:**
+    The core RAG table: one row per chunk of text that can be embedded + retrieved.
+
+    What it stores:
+
+    links back to case and document (case_id, doc_id)
+
+    chunk text + metadata (chunk_text, section_type, heading_path, token_count)
+
+    the vector representation (embedding VECTOR(1536))
+
+    Why it matters:
+
+    RAG retrieval is usually vector search over chunks (not whole documents)
+
+    you’ll pull top-N chunks by similarity, then aggregate them back to top-k cases
+
+    This is where pgvector actually gets used.
+
+**CASE_CARDS DB:**
+    One row per case containing a model-generated “case summary / fingerprint.”
+
+    What it stores:
+
+    a condensed textual representation (case_card_text)
+
+    tags that help filtering or hybrid retrieval (issue_tags, statute_tags, doctrine_tags)
+
+    generation metadata (generated_by_model, timestamp)
+
+    Why it matters:
+
+    speeds up retrieval (embed/search a compact representation)
+
+    improves relevance (retrieval can focus on issues/rules rather than random procedural text)
+
+    gives you stable “case-level” context to inject even if you only include a few chunks
+
