@@ -1,5 +1,8 @@
 # JudgeAI
 
+.env file:
+include a .env file that contains OPENAI_API_KEY = [INSERT KEY HERE] in the same directory as backend, frontend, etc.
+
 This Repo consists of three components:
 
 1. Blackbox Model (GPT 5 Nano)
