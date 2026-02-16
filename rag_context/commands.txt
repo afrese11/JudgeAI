@@ -1,67 +1,76 @@
 open psql: psql "postgresql://rag_user:rag_pass@localhost:5432/rag_db"
+docker compose up -d
 
 cases:
-rag_db=# CREATE TABLE cases (
-    case_id TEXT PRIMARY KEY,
-    docket_number TEXT,
-    judges TEXT[],
-
-    case_type TEXT,
-    procedural_posture TEXT,
+CREATE TABLE cases (
+    case_id TEXT PRIMARY KEY,              -- internal unique id (e.g., "22-1456_2023-04-11")
+    
+    docket_number TEXT NOT NULL,          -- from config.txt
+    
+    case_type TEXT,                       -- criminal, civil, immigration, etc.
+    procedural_posture TEXT,              -- appeal from summary judgment, sentencing, etc.
+    
     decision_date DATE,
-
-    disposition_label TEXT,
-    complexity_label TEXT,
-
-    oral_argument_minutes INTEGER,
-    argued_flag BOOLEAN,
-
-    ingest_version TEXT,
+    
+    disposition_label TEXT,               -- affirmed, reversed, remanded, mixed
+    complexity_label TEXT,                -- low / medium / high
+    
+    oral_argument_minutes INTEGER,        -- from config.txt
+    argued_flag BOOLEAN,                  -- derived (oral_argument_minutes > 0)
+    
+    ingest_version TEXT,                  -- track ingestion version
+    
     created_at TIMESTAMP DEFAULT NOW()
 );
 
-documents:
+
 CREATE TABLE documents (
     doc_id TEXT PRIMARY KEY,
+    
     case_id TEXT REFERENCES cases(case_id) ON DELETE CASCADE,
-
-    doc_type TEXT,
-    text_clean TEXT,
-
+    
+    doc_type TEXT DEFAULT 'decision',     -- fixed
+    
+    text_clean TEXT NOT NULL,             -- cleaned opinion text
+    
     page_count INTEGER,
     token_count INTEGER,
-
-    source_url TEXT,
+    
     created_at TIMESTAMP DEFAULT NOW()
 );
 
-chunks:
+
 CREATE TABLE chunks (
     chunk_id TEXT PRIMARY KEY,
+    
     case_id TEXT REFERENCES cases(case_id) ON DELETE CASCADE,
     doc_id TEXT REFERENCES documents(doc_id) ON DELETE CASCADE,
-
-    section_type TEXT,
-    heading_path TEXT,
-    chunk_text TEXT,
-
+    
+    section_type TEXT,                    -- facts, background, analysis, holding, dissent
+    heading_path TEXT,                    -- ANALYSIS > IV > Qualified Immunity
+    
+    chunk_text TEXT NOT NULL,
+    
     token_count INTEGER,
-
-    embedding VECTOR(1536),
-
+    
+    embedding VECTOR(1536),               -- match your embedding model dimension
+    
     created_at TIMESTAMP DEFAULT NOW()
 );
 
-case cards:
+
 CREATE TABLE case_cards (
-    case_id TEXT PRIMARY KEY REFERENCES cases(case_id) ON DELETE CASCADE,
-
-    case_card_text TEXT,
-    issue_tags TEXT[],
-    statute_tags TEXT[],
-    doctrine_tags TEXT[],
-
+    case_id TEXT PRIMARY KEY 
+        REFERENCES cases(case_id) ON DELETE CASCADE,
+    
+    case_card_text TEXT NOT NULL,         -- structured summary
+    
+    issue_tags TEXT[],                    -- {'suppression','sentencing'}
+    statute_tags TEXT[],                  -- {'18 USC 922(g)'}
+    doctrine_tags TEXT[],                 -- {'qualified immunity'}
+    
     generated_by_model TEXT,
     generated_at TIMESTAMP DEFAULT NOW()
 );
+
 
