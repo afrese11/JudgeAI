@@ -1,12 +1,9 @@
+// src/pages/Index.tsx
 import { useState } from 'react';
 import { FileDropZone } from '@/components/FileDropZone';
 import { OutputDisplay } from '@/components/OutputDisplay';
 import { Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-
-// HARDCODED PROMPT - Edit this to change the processing behavior
-const SYSTEM_PROMPT = `Analyze the provided files and generate a summary of their contents. 
-Include: file names, types, and key information found in each file.`;
 
 const Index = () => {
   const [files, setFiles] = useState<File[]>([]);
@@ -19,24 +16,55 @@ const Index = () => {
     setIsLoading(true);
     setOutput('');
 
-    // Simulate processing - Replace this with actual API call
-    // The SYSTEM_PROMPT above should be sent along with file contents
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    try {
+      const form = new FormData();
+      files.forEach((f) => form.append('files', f));
+      form.append('redact', 'false'); // later: hook this to a toggle UI if you want
 
-    // Mock output - Replace with actual API response
-    const mockOutput = `Processed ${files.length} file(s) with prompt:\n\n"${SYSTEM_PROMPT}"\n\nFiles analyzed:\n${files.map((f, i) => `${i + 1}. ${f.name} (${(f.size / 1024).toFixed(1)} KB)`).join('\n')}\n\n[Connect to your backend/API to get real processing results]`;
+      const res = await fetch('http://127.0.0.1:8000/api/judge', {
+        method: 'POST',
+        body: form,
+      });
 
-    setOutput(mockOutput);
-    setIsLoading(false);
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `Request failed: ${res.status}`);
+      }
+
+      const data: {
+        raw?: string;
+        case_summary?: string | null;
+        case_decision?: string | null;
+        error?: string;
+      } = await res.json();
+
+      if (data.error) throw new Error(data.error);
+
+      // Display the parsed output if possible; fallback to raw
+      const pretty =
+        data.case_summary && data.case_decision
+          ? [
+              '===CASE SUMMARY===',
+              data.case_summary,
+              '',
+              '===CASE DECISION===',
+              data.case_decision,
+            ].join('\n')
+          : data.raw || 'No output returned.';
+
+      setOutput(pretty);
+    } catch (err: any) {
+      setOutput(`Error: ${err?.message ?? String(err)}`);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   return (
     <div className="min-h-screen bg-background">
       <div className="container max-w-3xl py-12 px-4">
         <div className="text-center mb-10">
-          <h1 className="text-3xl font-bold text-foreground mb-2">
-            JudgeAI
-          </h1>
+          <h1 className="text-3xl font-bold text-foreground mb-2">JudgeAI</h1>
           <p className="text-muted-foreground">
             Upload legal documents for AI analysis.
           </p>
