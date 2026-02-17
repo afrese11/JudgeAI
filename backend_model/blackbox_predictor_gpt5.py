@@ -1,11 +1,11 @@
 import os
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 from docx import Document
 from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-import argparse
 
 # Load environment variables
 load_dotenv()
@@ -15,7 +15,7 @@ client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 # Define paths
 SCRIPT_DIR = Path(__file__).resolve().parent
-TEST_DATA_DIR = SCRIPT_DIR / "test_data"
+TEST_DATA_DIR = SCRIPT_DIR / "test_data_full"
 OUTPUT_DIR = SCRIPT_DIR / "case_outputs"
 
 # Create output directory if it doesn't exist
@@ -52,6 +52,17 @@ Predict and provide:
 1. A written judicial opinion that decides all of the issues raised on the appeal, based on your analysis of the arguments presented.
 2. Your PREDICTED determination of whether the case should be AFFIRMED, REVERSED, VACATED, or another disposition.
 3. Legal reasoning supporting your predicted decision, citing the arguments and law from the briefs.
+
+Base your predictions on:
+- Strength and persuasiveness of each party's legal arguments
+- How well applicable law and precedent support each side
+- Quality of legal reasoning and authority cited in the briefs
+- The facts as presented and their legal significance
+
+DO NOT base your prediction on:
+- Any actual appellate decision if mentioned in the documents
+- External knowledge of how this case was actually decided
+- Recognition of the parties, docket numbers, or jurisdiction
 
 Please structure your response exactly as follows:
 
@@ -122,52 +133,70 @@ def parse_gpt_response(response_text):
     
     return case_summary, case_decision
 
-def redact_pdf_content(pdf_path):
+def redact_pdf_content(pdf_path, max_retries=3):
     """Use OpenAI to redact identifying information from a PDF."""
     
     print(f"    - Redacting {pdf_path.name}")
     
-    # Upload the PDF
-    with open(pdf_path, "rb") as f:
-        uploaded_file = client.files.create(
-            file=f,
-            purpose="assistants"
-        )
-    
-    try:
-        response = client.chat.completions.create(
-            model="gpt-5-nano-2025-08-07",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": REDACTION_PROMPT},
-                        {
-                            "type": "file",
-                            "file": {
-                                "file_id": uploaded_file.id
-                            }
-                        }
-                    ]
-                }
-            ]
-        )
-        
-        redacted_text = response.choices[0].message.content
-        
-        # Clean up the uploaded file
-        client.files.delete(uploaded_file.id)
-        
-        return redacted_text
-        
-    except Exception as e:
-        print(f"    Error redacting {pdf_path.name}: {str(e)}")
-        # Clean up on error
+    for attempt in range(max_retries):
         try:
+            # Upload the PDF
+            with open(pdf_path, "rb") as f:
+                uploaded_file = client.files.create(
+                    file=f,
+                    purpose="assistants"
+                )
+            
+            # Add a small delay to avoid rate limiting
+            time.sleep(1)
+            
+            response = client.chat.completions.create(
+                model="gpt-5-nano-2025-08-07",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": REDACTION_PROMPT},
+                            {
+                                "type": "file",
+                                "file": {
+                                    "file_id": uploaded_file.id
+                                }
+                            }
+                        ]
+                    }
+                ],
+                timeout=120.0  # Increase timeout to 2 minutes
+            )
+            
+            redacted_text = response.choices[0].message.content
+            
+            # Clean up the uploaded file
             client.files.delete(uploaded_file.id)
-        except:
-            pass
-        return None
+            
+            return redacted_text
+            
+        except Exception as e:
+            print(f"    Attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+            
+            # Try to clean up the file if it was uploaded
+            try:
+                if 'uploaded_file' in locals():
+                    client.files.delete(uploaded_file.id)
+            except:
+                pass
+            
+            # If this was the last attempt, return None
+            if attempt == max_retries - 1:
+                print(f"    Error redacting {pdf_path.name} after {max_retries} attempts")
+                return None
+            
+            # Wait before retrying (exponential backoff)
+            wait_time = 2 ** attempt  # 1s, 2s, 4s
+            print(f"    Waiting {wait_time} seconds before retry...")
+            time.sleep(wait_time)
+    
+    return None
 
 def process_case_directory(case_dir, redact=False):
     """Process all PDFs in a single case directory.
@@ -183,6 +212,15 @@ def process_case_directory(case_dir, redact=False):
         print(f"No PDFs found in {case_id}")
         return None
     
+    # Check if this case has already been processed
+    case_output_dir = OUTPUT_DIR / case_id
+    summary_path = case_output_dir / f"{case_id}_summary.docx"
+    decision_path = case_output_dir / f"{case_id}_decision.docx"
+    
+    if case_output_dir.exists() and summary_path.exists() and decision_path.exists():
+        print(f"\nSkipping case: {case_id} (already processed)")
+        return None
+    
     print(f"\nProcessing case: {case_id}")
     print(f"Found {len(pdf_files)} PDF(s)")
     print(f"Redaction: {'ENABLED' if redact else 'DISABLED'}")
@@ -196,7 +234,11 @@ def process_case_directory(case_dir, redact=False):
         case_output_dir = OUTPUT_DIR / case_id
         case_output_dir.mkdir(exist_ok=True)
         
-        for pdf_path in pdf_files:
+        for i, pdf_path in enumerate(pdf_files):
+            # Add delay between files to avoid rate limiting
+            if i > 0:
+                time.sleep(2)
+            
             redacted_text = redact_pdf_content(pdf_path)
             if redacted_text:
                 redacted_texts.append({
@@ -205,7 +247,6 @@ def process_case_directory(case_dir, redact=False):
                 })
                 
                 # Save each redacted document as a separate text file
-                # Convert PDF filename to text filename (e.g., "brief.pdf" -> "brief_redacted.txt")
                 txt_filename = pdf_path.stem + "_redacted.txt"
                 txt_filepath = case_output_dir / txt_filename
                 
@@ -215,6 +256,8 @@ def process_case_directory(case_dir, redact=False):
                     f.write(redacted_text)
                 
                 print(f"    Saved: {txt_filename}")
+            else:
+                print(f"    WARNING: Skipping {pdf_path.name} - redaction failed")
         
         if not redacted_texts:
             print(f"  Failed to redact documents for {case_id}")
@@ -242,7 +285,8 @@ def process_case_directory(case_dir, redact=False):
                         "role": "user",
                         "content": full_prompt
                     }
-                ]
+                ],
+                timeout=180.0  # 3 minute timeout for large combined text
             )
             
             result = response.choices[0].message.content
@@ -292,7 +336,8 @@ def process_case_directory(case_dir, redact=False):
                         "role": "user",
                         "content": message_content
                     }
-                ]
+                ],
+                timeout=180.0  # 3 minute timeout
             )
             
             result = response.choices[0].message.content
@@ -374,12 +419,12 @@ def main(redact=False):
     print(f"All outputs saved to: {OUTPUT_DIR}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Your script description')
-    parser.add_argument('--redact', action='store_true', help='Enable redaction')
+    import sys
     
-    args = parser.parse_args()
+    # Check for command line arguments
+    redact = False
+    if len(sys.argv) > 1 and sys.argv[1] == '--redact':
+        redact = True
     
-    # Default to redact = False if not provided
-    redact = args.redact
-    
+    # Set redact=True to enable redaction, redact=False to disable
     main(redact=redact)
