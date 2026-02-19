@@ -1,12 +1,20 @@
 # server.py
 import os
+import sys
 import tempfile
-from typing import List, Optional
+from dataclasses import asdict
+from typing import List, Optional, Tuple
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 
 from judge_core import run_prediction_with_uploaded_pdfs
+
+# Ensure project root is on path so rag_context can be imported (e.g. when run from backend_model)
+_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+from rag_context.top_k_retrieval import retrieve_similar_cases_from_pdf_uploads
 
 
 # -----------------------------
@@ -46,7 +54,9 @@ Predict and provide:
 3. Legal reasoning supporting your predicted decision, citing the arguments and law from the briefs.
 
 Please structure your response exactly as follows:
+""".strip()
 
+PROMPT_APPEND = """
 ===CASE SUMMARY===
 [Your predicted case summary here]
 
@@ -101,6 +111,40 @@ def health():
     return {"ok": True}
 
 
+@app.post("/api/retrieve-similar")
+async def retrieve_similar(
+    files: List[UploadFile] = File(...),
+    k: int = Form(3),
+):
+    """
+    Accept drag-and-drop PDF case briefs; return top-k similar cases from the RAG index.
+    """
+    if not files:
+        return {"error": "No files uploaded."}
+
+    uploads: List[Tuple[str, bytes]] = []
+    for uf in files:
+        name = uf.filename or "brief.pdf"
+        ext = os.path.splitext(name)[1].lower()
+        if ext != ".pdf":
+            return {"error": f"Only PDFs supported. Got: {name}"}
+        pdf_bytes = await uf.read()
+        uploads.append((name, pdf_bytes))
+
+    try:
+        results = retrieve_similar_cases_from_pdf_uploads(
+            uploads,
+            k=k,
+        )
+        return {
+            "num_briefs": len(uploads),
+            "k": k,
+            "cases": [asdict(card) for card in results],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.post("/api/judge")
 async def judge_case(
     files: List[UploadFile] = File(...),
@@ -126,7 +170,7 @@ async def judge_case(
 
         prompt = PROMPT_TEMPLATE.format(num_docs=len(tmp_paths))
 
-        raw = run_prediction_with_uploaded_pdfs(tmp_paths, prompt)
+        raw = run_prediction_with_uploaded_pdfs(tmp_paths, prompt + PROMPT_APPEND)
 
         case_summary, case_decision = parse_gpt_response(raw)
 
