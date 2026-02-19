@@ -1,5 +1,5 @@
 // src/pages/Index.tsx
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { FileDropZone } from '@/components/FileDropZone';
 import { OutputDisplay } from '@/components/OutputDisplay';
 import { Sparkles } from 'lucide-react';
@@ -10,6 +10,13 @@ const Index = () => {
   const [output, setOutput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
+  // If VITE_API_BASE_URL is unset, use relative /api (works if you proxy locally,
+  // or if you serve frontend+backend behind the same domain in prod).
+  const apiBase = useMemo(() => {
+    const envBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
+    return (envBase && envBase.trim()) ? envBase.trim().replace(/\/+$/, '') : '';
+  }, []);
+
   const handleProcess = async () => {
     if (files.length === 0) return;
 
@@ -19,9 +26,11 @@ const Index = () => {
     try {
       const form = new FormData();
       files.forEach((f) => form.append('files', f));
-      form.append('redact', 'false'); // later: hook this to a toggle UI if you want
+      form.append('redact', 'false');
 
-      const res = await fetch('http://127.0.0.1:8000/api/judge', {
+      const url = `${apiBase}/api/judge`;
+
+      const res = await fetch(url, {
         method: 'POST',
         body: form,
       });
@@ -40,7 +49,6 @@ const Index = () => {
 
       if (data.error) throw new Error(data.error);
 
-      // Display the parsed output if possible; fallback to raw
       const pretty =
         data.case_summary && data.case_decision
           ? [
