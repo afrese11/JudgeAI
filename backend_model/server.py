@@ -1,18 +1,13 @@
 # server.py
 import os
 import tempfile
-from typing import List, Optional
+from typing import List
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 
 from judge_core import run_prediction_with_uploaded_pdfs
 
-
-# -----------------------------
-# Your existing prompt + parsing
-# (inlined so it's copy/pasteable)
-# -----------------------------
 
 PROMPT_TEMPLATE = """
 You are serving as an appellate judge reviewing an appellate case which includes {num_docs} document(s).
@@ -24,28 +19,7 @@ CRITICAL INSTRUCTIONS:
 - Treat this as if YOU are the appellate court making the decision for the first time.
 - Base your prediction solely on: the strength of legal arguments presented, applicable law and precedent discussed in the briefs, the quality of each party's legal reasoning, and the facts of the case.
 
-The documents may include:
-- Appellant's brief (arguing the lower court was wrong)
-- Appellee's brief (defending the lower court decision)
-- Reply briefs
-- Addendums with relevant statutes, exhibits, or the lower court's decision
-
 Your task is to produce TWO separate PREDICTIVE outputs:
-
-**OUTPUT 1: CASE SUMMARY DOCUMENT (PREDICTIVE)**
-Predict and provide:
-1. A brief 3-5 sentence summary of the key legal issues on appeal.
-2. Statement of the lower court's decision (what ruling is being appealed from).
-3. Your PREDICTED recommendation for the length of oral argument, based on the legal complexity of the issues on appeal.
-4. An explanation of the case complexity and your reasoning for the oral argument time recommendation.
-
-**OUTPUT 2: CASE DECISION DOCUMENT (PREDICTIVE)**
-Predict and provide:
-1. A written judicial opinion that decides all of the issues raised on the appeal, based on your analysis of the arguments presented.
-2. Your PREDICTED determination of whether the case should be AFFIRMED, REVERSED, VACATED, or another disposition.
-3. Legal reasoning supporting your predicted decision, citing the arguments and law from the briefs.
-
-Please structure your response exactly as follows:
 
 ===CASE SUMMARY===
 [Your predicted case summary here]
@@ -56,9 +30,6 @@ Please structure your response exactly as follows:
 
 
 def parse_gpt_response(response_text: str):
-    """
-    Returns (case_summary, case_decision) or (None, None) if markers missing.
-    """
     parts = response_text.split("===CASE SUMMARY===")
     if len(parts) < 2:
         return None, None
@@ -73,23 +44,31 @@ def parse_gpt_response(response_text: str):
     return case_summary, case_decision
 
 
-# -----------------------------
-# FastAPI app
-# -----------------------------
+def _get_cors_origins() -> List[str]:
+    """
+    Comma-separated list of allowed origins, e.g.
+    FRONTEND_ORIGINS="http://localhost:5173,https://yourapp.vercel.app"
+    """
+    raw = os.getenv("FRONTEND_ORIGINS", "")
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
 
-app = FastAPI()
-
-# Dev CORS so your Vite frontend can call the Python backend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+    # sensible local defaults
+    defaults = [
         "http://localhost:8080",
         "http://127.0.0.1:8080",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-    ],
+    ]
+    return origins or defaults
+
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -104,14 +83,15 @@ def health():
 @app.post("/api/judge")
 async def judge_case(
     files: List[UploadFile] = File(...),
-    redact: bool = Form(False),  # placeholder for later
+    redact: bool = Form(False),
 ):
-    # Save uploads to temp files
     tmp_paths: List[str] = []
+
     try:
         if not files:
             return {"error": "No files uploaded."}
 
+        # Save uploads to temp files
         for uf in files:
             name = uf.filename or "uploaded.pdf"
             ext = os.path.splitext(name)[1].lower()
@@ -120,14 +100,16 @@ async def judge_case(
 
             fd, path = tempfile.mkstemp(suffix=".pdf")
             os.close(fd)
+
             with open(path, "wb") as out:
                 out.write(await uf.read())
+
             tmp_paths.append(path)
 
         prompt = PROMPT_TEMPLATE.format(num_docs=len(tmp_paths))
+        model = os.getenv("OPENAI_MODEL", "gpt-5")
 
-        raw = run_prediction_with_uploaded_pdfs(tmp_paths, prompt)
-
+        raw = run_prediction_with_uploaded_pdfs(tmp_paths, prompt, model=model)
         case_summary, case_decision = parse_gpt_response(raw)
 
         return {
@@ -136,11 +118,16 @@ async def judge_case(
             "case_decision": case_decision,
             "num_documents": len(tmp_paths),
             "redact": redact,
+            "model": model,
         }
+
+    except Exception as e:
+        # helpful error surface for debugging deploys
+        return {"error": f"{type(e).__name__}: {str(e)}"}
 
     finally:
         for p in tmp_paths:
             try:
                 os.remove(p)
-            except:
+            except Exception:
                 pass

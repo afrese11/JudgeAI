@@ -1,57 +1,69 @@
 # judge_core.py
 import os
+from typing import List
+
 from openai import OpenAI
-from dotenv import load_dotenv
 
-load_dotenv()  # Load environment variables from .env file
+# The SDK reads OPENAI_API_KEY from the environment automatically.
+client = OpenAI()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def run_prediction_with_uploaded_pdfs(
-    pdf_paths: list[str],
+    pdf_paths: List[str],
     prompt_text: str,
-    model: str = "gpt-5-nano-2025-08-07",
+    model: str | None = None,
 ) -> str:
     """
-    Upload PDFs, call the model with file attachments, return raw text.
+    Upload PDFs, call the Responses API with file inputs, return output text.
     """
-    uploaded_files = []
+    model = model or os.getenv("OPENAI_MODEL", "gpt-5")
+
+    uploaded_file_ids: List[str] = []
     file_handles = []
 
     try:
-        # Upload PDFs
+        # Upload PDFs (recommended purpose for model inputs is "user_data")
         for path in pdf_paths:
             fh = open(path, "rb")
             file_handles.append(fh)
 
             uploaded = client.files.create(
                 file=fh,
-                purpose="user_data",  # recommended for file inputs
+                purpose="user_data",
             )
-            uploaded_files.append(uploaded)
+            uploaded_file_ids.append(uploaded.id)
 
-        # Build message with PDFs attached
-        message_content = [{"type": "text", "text": prompt_text}]
-        for uf in uploaded_files:
-            message_content.append({"type": "file", "file": {"file_id": uf.id}})
+        # Build Responses API input with multiple files + your prompt text.
+        # (For PDF inputs, Responses API is the recommended path.) :contentReference[oaicite:1]{index=1}
+        content = []
+        for fid in uploaded_file_ids:
+            content.append({"type": "input_file", "file_id": fid})
+        content.append({"type": "input_text", "text": prompt_text})
 
-        resp = client.chat.completions.create(
+        response = client.responses.create(
             model=model,
-            messages=[{"role": "user", "content": message_content}],
+            input=[
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ],
         )
-        return resp.choices[0].message.content
+
+        # The docs show using response.output_text for Responses API output. :contentReference[oaicite:2]{index=2}
+        return response.output_text or ""
 
     finally:
         # Close local file handles
         for fh in file_handles:
             try:
                 fh.close()
-            except:
+            except Exception:
                 pass
 
-        # Delete uploaded OpenAI files
-        for uf in uploaded_files:
+        # Best-effort cleanup: delete uploaded OpenAI files
+        for fid in uploaded_file_ids:
             try:
-                client.files.delete(uf.id)
-            except:
+                client.files.delete(fid)
+            except Exception:
                 pass
