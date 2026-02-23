@@ -12,6 +12,7 @@ const Index = () => {
 
   // If VITE_API_BASE_URL is unset, use relative /api (works if you proxy locally,
   // or if you serve frontend+backend behind the same domain in prod).
+  // Vite fix
   const apiBase = useMemo(() => {
     const envBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
     return (envBase && envBase.trim()) ? envBase.trim().replace(/\/+$/, '') : '';
