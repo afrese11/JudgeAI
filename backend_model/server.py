@@ -3,7 +3,7 @@ import os
 import tempfile
 from typing import List
 
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 
 from judge_core import run_prediction_with_uploaded_pdfs
@@ -28,6 +28,9 @@ Your task is to produce TWO separate PREDICTIVE outputs:
 [Your predicted case decision here]
 """.strip()
 
+def _authorized(passcode: str | None) -> bool:
+    expected = os.getenv("JUDGEAI_SHARED_PASSCODE", "")
+    return bool(expected) and (passcode == expected)
 
 def parse_gpt_response(response_text: str):
     parts = response_text.split("===CASE SUMMARY===")
@@ -84,7 +87,10 @@ def health():
 async def judge_case(
     files: List[UploadFile] = File(...),
     redact: bool = Form(False),
+    x_judgeai_passcode: str | None = Header(default=None),
 ):
+    if not _authorized(x_judgeai_passcode):
+        return {"error": "Unauthorized"}
     tmp_paths: List[str] = []
 
     try:

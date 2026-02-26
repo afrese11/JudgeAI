@@ -31,9 +31,14 @@ const Index = () => {
 
       const url = `${apiBase}/api/judge`;
 
+      const passcode = localStorage.getItem("judgeai_passcode") || "";
+
       const res = await fetch(url, {
-        method: 'POST',
+        method: "POST",
         body: form,
+        headers: {
+          "X-JudgeAI-Passcode": passcode,
+        },
       });
 
       if (!res.ok) {
