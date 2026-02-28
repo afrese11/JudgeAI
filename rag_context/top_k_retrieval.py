@@ -26,7 +26,7 @@ import psycopg
 from pypdf import PdfReader
 from psycopg.rows import dict_row
 
-from config import DATABASE_URL, API_KEY
+from rag_context.config import DATABASE_URL, API_KEY
 
 logger = logging.getLogger("rag_retrieval")
 
@@ -102,6 +102,15 @@ class RetrievedCaseCard:
     doctrine_tags: Optional[List[str]] = None
     procedural_posture: Optional[str] = None
     score_breakdown: Optional[ScoreBreakdown] = None
+
+
+def _preview(text: str, max_chars: int = 180) -> str:
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= max_chars:
+        return compact
+    return compact[:max_chars] + "..."
 
 
 # ─────────────────────────────────────────────
@@ -429,7 +438,36 @@ def retrieve_top_k_case_cards(
     )
 
     if effective_k <= 0:
+        logger.warning(
+            "[retrieve_top_k_case_cards] effective_k<=0; returning no results. k=%s cfg.k=%s",
+            k,
+            cfg.k,
+        )
         return []
+
+    logger.info(
+        "[retrieve_top_k_case_cards] start k=%d effective_k=%d candidate_chunks=%d fetch_chunks=%d "
+        "candidate_n=%d chunk_cap=%d decay=%.3f allow_cross_type=%s",
+        k,
+        effective_k,
+        candidate_chunks,
+        fetch_chunks,
+        cfg.candidate_n,
+        chunk_cap,
+        cfg.decay,
+        cfg.allow_cross_type,
+    )
+    if query_signals:
+        logger.info(
+            "[retrieve_top_k_case_cards] query_signals case_type=%s posture=%s posture_bucket=%s "
+            "doctrines=%d statutes=%d issues=%d",
+            query_signals.case_type,
+            query_signals.procedural_posture,
+            query_signals.posture_bucket,
+            len(query_signals.doctrine_tags),
+            len(query_signals.statute_tags),
+            len(query_signals.issue_tags),
+        )
 
     emb_literal = "[" + ",".join(f"{x:.8f}" for x in query_embedding) + "]"
 
@@ -446,6 +484,10 @@ def retrieve_top_k_case_cards(
             (emb_literal, emb_literal, fetch_chunks),
         )
         chunk_rows = cur.fetchall()
+    logger.info(
+        "[retrieve_top_k_case_cards] step1 nearest chunk rows=%d",
+        len(chunk_rows),
+    )
 
     # ── Step 2: Aggregate chunk scores per case with decay ──
     per_case: Dict[str, List[float]] = {}
@@ -466,8 +508,18 @@ def retrieve_top_k_case_cards(
     candidate_ids = sorted(
         norm_embed, key=norm_embed.get, reverse=True,
     )[:cfg.candidate_n]
+    logger.info(
+        "[retrieve_top_k_case_cards] step2 unique_cases=%d candidate_ids=%d top_candidate_sample=%s",
+        len(per_case),
+        len(candidate_ids),
+        candidate_ids[:5],
+    )
 
     if not candidate_ids:
+        logger.warning(
+            "[retrieve_top_k_case_cards] no candidate_ids after embedding aggregation. "
+            "Possible causes: empty chunks table, embedding mismatch, or DB query returned no rows."
+        )
         return []
 
     # ── Step 3: Fetch metadata + tags for all candidates ──
@@ -484,6 +536,11 @@ def retrieve_top_k_case_cards(
             (candidate_ids,),
         )
         meta_rows = cur.fetchall()
+    logger.info(
+        "[retrieve_top_k_case_cards] step3 fetched metadata rows=%d for candidate_ids=%d",
+        len(meta_rows),
+        len(candidate_ids),
+    )
 
     meta_map: Dict[str, Dict] = {r["case_id"]: r for r in meta_rows}
 
@@ -540,6 +597,10 @@ def retrieve_top_k_case_cards(
             posture=posture_score,
             raw_embed_agg=raw_embed_agg.get(cid, 0.0),
         )
+    logger.info(
+        "[retrieve_top_k_case_cards] step4 computed final scores for %d candidates",
+        len(final_scores),
+    )
 
     # ── Step 5: Case-type gating ──
     pre_gate_ranked = sorted(
@@ -558,8 +619,25 @@ def retrieve_top_k_case_cards(
         ranked = post_gate
     else:
         ranked = pre_gate_ranked
+    logger.info(
+        "[retrieve_top_k_case_cards] step5 gating q_case_type=%s pre_gate=%d gated_out=%d post_gate=%d",
+        q_case_type,
+        len(pre_gate_ranked),
+        len(gated_out),
+        len(ranked),
+    )
 
     top_ids = ranked[:effective_k]
+    if not top_ids:
+        logger.warning(
+            "[retrieve_top_k_case_cards] no top_ids after ranking/gating. "
+            "If pre_gate>0 and post_gate=0, case-type gating likely filtered all candidates."
+        )
+    else:
+        logger.info(
+            "[retrieve_top_k_case_cards] step6 top_ids=%s",
+            top_ids,
+        )
 
     # ── Step 6: Build result objects ──
     results: List[RetrievedCaseCard] = []
@@ -591,6 +669,10 @@ def retrieve_top_k_case_cards(
         candidate_types=candidate_types,
     )
     logger.info(json.dumps(retrieval_log))
+    logger.info(
+        "[retrieve_top_k_case_cards] complete results_count=%d",
+        len(results),
+    )
 
     return results
 
@@ -781,17 +863,46 @@ def retrieve_similar_cases_for_new_case(
       - Retrieve top-k cases with reranking and gating
     """
     if not briefs:
+        logger.warning("[retrieve_similar_cases_for_new_case] No briefs provided; returning [].")
         return []
 
     cfg = config or RetrievalConfig(k=k)
+    logger.info(
+        "[retrieve_similar_cases_for_new_case] start briefs=%d requested_k=%d effective_k=%d "
+        "candidate_chunks=%d db_url_set=%s",
+        len(briefs),
+        k,
+        cfg.k,
+        candidate_chunks,
+        bool(db_url),
+    )
     signals = extract_query_signals(
         [b.text for b in briefs], llm_metadata=llm_metadata,
     )
+    logger.info(
+        "[retrieve_similar_cases_for_new_case] extracted signals case_type=%s posture=%s "
+        "posture_bucket=%s doctrines=%d statutes=%d issues=%d",
+        signals.case_type,
+        signals.procedural_posture,
+        signals.posture_bucket,
+        len(signals.doctrine_tags),
+        len(signals.statute_tags),
+        len(signals.issue_tags),
+    )
     fingerprint = build_query_fingerprint(briefs, query_signals=signals)
+    logger.info(
+        "[retrieve_similar_cases_for_new_case] fingerprint chars=%d preview=%s",
+        len(fingerprint),
+        _preview(fingerprint),
+    )
     embedding = embed_text_openai(fingerprint)
+    logger.info(
+        "[retrieve_similar_cases_for_new_case] embedding size=%d",
+        len(embedding),
+    )
 
     with psycopg.connect(db_url) as conn:
-        return retrieve_top_k_case_cards(
+        results = retrieve_top_k_case_cards(
             conn=conn,
             query_embedding=embedding,
             k=k,
@@ -799,6 +910,12 @@ def retrieve_similar_cases_for_new_case(
             config=cfg,
             query_signals=signals,
         )
+    logger.info(
+        "[retrieve_similar_cases_for_new_case] end results_count=%d result_case_ids=%s",
+        len(results),
+        [r.case_id for r in results],
+    )
+    return results
 
 
 # ─────────────────────────────────────────────
@@ -847,24 +964,44 @@ def retrieve_similar_cases_from_pdf_uploads(
         List of RetrievedCaseCard for the top-k similar cases.
     """
     if not uploads:
+        logger.warning("[retrieve_similar_cases_from_pdf_uploads] No uploads provided; returning [].")
         return []
 
     url = db_url or DATABASE_URL
     briefs: List[BriefInput] = []
+    logger.info(
+        "[retrieve_similar_cases_from_pdf_uploads] start uploads=%d requested_k=%d candidate_chunks=%d",
+        len(uploads),
+        k,
+        candidate_chunks,
+    )
     for label, pdf_bytes in uploads:
         text = extract_text_from_pdf_bytes(pdf_bytes)
         name = (label or "brief").strip()
         if name.lower().endswith(".pdf"):
             name = name[:-4].strip() or "brief"
         briefs.append(BriefInput(label=name, text=text))
+        logger.info(
+            "[retrieve_similar_cases_from_pdf_uploads] extracted text label=%s pdf_bytes=%d text_chars=%d text_preview=%s",
+            name,
+            len(pdf_bytes or b""),
+            len(text),
+            _preview(text),
+        )
 
-    return retrieve_similar_cases_for_new_case(
+    results = retrieve_similar_cases_for_new_case(
         db_url=url,
         briefs=briefs,
         k=k,
         candidate_chunks=candidate_chunks,
         config=config,
     )
+    logger.info(
+        "[retrieve_similar_cases_from_pdf_uploads] end results_count=%d result_case_ids=%s",
+        len(results),
+        [r.case_id for r in results],
+    )
+    return results
 
 
 # ─────────────────────────────────────────────

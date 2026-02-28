@@ -36,7 +36,7 @@ def rough_token_count(s: str) -> int:
 # OpenAI client uses API_KEY from config.py (loads OPENAI_API_KEY via .env).
 from openai import OpenAI
 
-from config import DATABASE_URL, API_KEY
+from rag_context.config import DATABASE_URL, API_KEY
 
 # Schema: chunks.embedding is VECTOR(1536) for text-embedding-3-small
 EMBEDDING_DIMENSION = 1536
@@ -297,27 +297,41 @@ def ensure_case_exists(conn: psycopg.Connection, case_id: str) -> None:
 # Default train dataset path relative to this script (rag_context/)
 DEFAULT_TRAIN_DATASET = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "AIth Circuit Test Dataset",
-    "train",
+    "sept. 2024 decisions"
 )
 
 
 def _iter_train_decision_pdfs(train_dir: str):
     """
-    Yield (case_id, pdf_path) for each case directory in train_dir.
-    Extracts decision PDFs only; config.txt in each directory is ignored.
+    Yield (case_id, pdf_path) for each case in train_dir.
+
+    Supports both layouts:
+    1) Nested: <train_dir>/<case_id>/<case_id> decision.pdf
+    2) Flat:   <train_dir>/<case_id> decision.pdf
     """
     if not os.path.isdir(train_dir):
         raise FileNotFoundError(f"Train dataset directory not found: {train_dir}")
     for name in sorted(os.listdir(train_dir)):
-        case_dir = os.path.join(train_dir, name)
-        if not os.path.isdir(case_dir) or name.startswith("."):
+        if name.startswith("."):
             continue
-        pdf_name = f"{name} decision.pdf"
-        pdf_path = os.path.join(case_dir, pdf_name)
-        if not os.path.isfile(pdf_path):
+        path = os.path.join(train_dir, name)
+
+        # Nested layout: <train_dir>/<case_id>/<case_id> decision.pdf
+        if os.path.isdir(path):
+            case_id = name
+            pdf_name = f"{case_id} decision.pdf"
+            pdf_path = os.path.join(path, pdf_name)
+            if not os.path.isfile(pdf_path):
+                continue
+            yield case_id, pdf_path
             continue
-        yield name, pdf_path
+
+        # Flat layout: <train_dir>/<case_id> decision.pdf
+        if os.path.isfile(path) and name.lower().endswith(" decision.pdf"):
+            case_id = name[: -len(" decision.pdf")].strip()
+            if not case_id:
+                continue
+            yield case_id, path
 
 
 def main():

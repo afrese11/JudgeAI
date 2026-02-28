@@ -1,0 +1,16 @@
+# Web API
+fastapi
+uvicorn[standard]
+
+# PDF handling
+pypdf
+
+# Database
+psycopg[binary]
+psycopg2-binary
+
+# OpenAI
+openai
+
+# Config / env
+python-dotenv

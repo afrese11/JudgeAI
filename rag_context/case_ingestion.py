@@ -1,5 +1,4 @@
-from config import API_KEY
-from config import DATABASE_URL
+from rag_context.config import API_KEY, DATABASE_URL
 
 import json
 import os
@@ -17,7 +16,7 @@ from openai import OpenAI  # pip install openai
 case_table_prompt = """
 You are an information extraction engine for an appellate-case ingestion pipeline.
 
-Your job: read the provided case decision brief, plus a separate config.txt snippet, and return a SINGLE JSON object that matches the schema below exactly. Do not include any additional keys. Do not include markdown. Do not include commentary.
+Your job: read the provided case decision brief, plus a separate config.txt snippet (if provided), and return a SINGLE JSON object that matches the schema below exactly. Do not include any additional keys. Do not include markdown. Do not include commentary.
 
 TARGET OUTPUT (strict JSON; no trailing commas):
 {
@@ -38,10 +37,11 @@ HARD RULES
 2) If a field is not clearly supported by the text, use null (or "unknown" only for the label fields as allowed above).
 3) Do NOT guess docket numbers, dates, or outcomes. Only extract if explicitly present or reliably inferable from an unambiguous statement.
 4) decision_date must be an ISO date YYYY-MM-DD if present; otherwise null.
-5) oral_argument_minutes: extract from the config (or decision text) whenever a duration is mentioned (e.g. "15 minutes", "20 min"); else null.
-6) argued_flag: true if oral argument occurred; false if explicitly indicates "submitted" / "no oral argument"; else null.
-7) Consistency: whenever you set argued_flag to true and the config or decision text mentions an oral argument duration (in minutes or other units), you MUST also set oral_argument_minutes to that value (convert to integer minutes). Do not leave oral_argument_minutes null when a duration is present and argued_flag is true.
-8) ingest_version must be copied exactly from the provided INGEST_VERSION value.
+5) If no config file is provided, you MUST set oral_argument_minutes to null and argued_flag to null.
+6) If a config file is provided, oral_argument_minutes: extract from config whenever a duration is mentioned (e.g. "15 minutes", "20 min"); else null.
+7) If a config file is provided, argued_flag: true if oral argument occurred; false if explicitly indicates "submitted" / "no oral argument"; else null.
+8) Consistency (config provided only): whenever you set argued_flag to true and the config mentions an oral argument duration (in minutes or other units), you MUST also set oral_argument_minutes to that value (convert to integer minutes). Do not leave oral_argument_minutes null when a duration is present and argued_flag is true.
+9) ingest_version must be copied exactly from the provided INGEST_VERSION value.
 
 FIELD EXTRACTION GUIDANCE
 - case_id:
@@ -68,7 +68,8 @@ You will be given the raw contents of a config file (if provided). Config files 
 - "docket #: 23-2869" or "docket_number=23-2869"
 - "oral argument: 15 minutes" or "oral_argument_minutes=15" or "oral_argument_duration=15"
 Parse the config to extract: docket_number (string), oral_argument_minutes (integer; convert to minutes if given in other units), and argued_flag (true if oral argument occurred or a duration is present, false if "submitted" or "no oral argument"). Use null only for fields not found.
-Important: If the config (or decision text) states an oral argument duration in any form (e.g. "15 minutes", "20 min"), you MUST set both argued_flag=true and oral_argument_minutes to that integer. Never set argued_flag=true while leaving oral_argument_minutes null when a duration is stated.
+If no config file is provided, set oral_argument_minutes=null and argued_flag=null (do not infer these two fields from decision text alone).
+Important: If the config states an oral argument duration in any form (e.g. "15 minutes", "20 min"), you MUST set both argued_flag=true and oral_argument_minutes to that integer. Never set argued_flag=true while leaving oral_argument_minutes null when a duration is stated.
 
 Now produce the JSON object only.
 """
@@ -332,28 +333,44 @@ def upsert_case_row(db_url: str, row: Dict[str, Any]) -> None:
 # Default train dataset path relative to this script (rag_context/)
 DEFAULT_TRAIN_DATASET = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "AIth Circuit Test Dataset",
-    "train",
+    "sept. 2024 decisions"
 )
 
 
 def _iter_train_cases(train_dir: str):
-    """Yield (case_dir, pdf_path, config_path) for each case in train_dir."""
+    """
+    Yield (case_id, pdf_path, config_path) for each case in train_dir.
+
+    Supports both layouts:
+    1) Nested: <train_dir>/<case_id>/<case_id> decision.pdf (+ optional config.txt)
+    2) Flat:   <train_dir>/<case_id> decision.pdf
+    """
     if not os.path.isdir(train_dir):
         raise FileNotFoundError(f"Train dataset directory not found: {train_dir}")
     for name in sorted(os.listdir(train_dir)):
-        case_dir = os.path.join(train_dir, name)
-        if not os.path.isdir(case_dir) or name.startswith("."):
+        if name.startswith("."):
             continue
-        # PDF: "{name} decision.pdf"
-        pdf_name = f"{name} decision.pdf"
-        pdf_path = os.path.join(case_dir, pdf_name)
-        if not os.path.isfile(pdf_path):
+        path = os.path.join(train_dir, name)
+
+        # Nested layout: <train_dir>/<case_id>/<case_id> decision.pdf
+        if os.path.isdir(path):
+            case_id = name
+            pdf_name = f"{case_id} decision.pdf"
+            pdf_path = os.path.join(path, pdf_name)
+            if not os.path.isfile(pdf_path):
+                continue
+            config_path = os.path.join(path, "config.txt")
+            if not os.path.isfile(config_path):
+                config_path = None
+            yield case_id, pdf_path, config_path
             continue
-        config_path = os.path.join(case_dir, "config.txt")
-        if not os.path.isfile(config_path):
-            config_path = None
-        yield case_dir, pdf_path, config_path
+
+        # Flat layout: <train_dir>/<case_id> decision.pdf
+        if os.path.isfile(path) and name.lower().endswith(" decision.pdf"):
+            case_id = name[: -len(" decision.pdf")].strip()
+            if not case_id:
+                continue
+            yield case_id, path, None
 
 
 def main() -> None:
@@ -367,8 +384,7 @@ def main() -> None:
 
     total = 0
     errors = []
-    for case_dir, pdf_path, config_path in _iter_train_cases(train_dir):
-        case_id = os.path.basename(case_dir)
+    for case_id, pdf_path, config_path in _iter_train_cases(train_dir):
         try:
             raw_config = read_config_file(config_path)
             decision_text = extract_text_from_pdf(pdf_path)

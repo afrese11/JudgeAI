@@ -9,7 +9,7 @@ from psycopg.rows import dict_row
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from config import API_KEY, DATABASE_URL
+from rag_context.config import API_KEY, DATABASE_URL
 
 load_dotenv()
 
@@ -18,7 +18,7 @@ MAX_EVIDENCE_CHARS = 120_000  # rough cap; the model will still have its own con
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 client = OpenAI(api_key=API_KEY)
-REGEN = True
+REGEN = False
 MAX_CASES = 100
 
 CASE_CARD_SCHEMA: Dict[str, Any] = {
