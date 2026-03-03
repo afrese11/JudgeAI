@@ -8,9 +8,12 @@ from typing import Any, Dict, List, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Load backend_model/.env so DATABASE_URL (and others) are available
+# Load backend_model/.env and project root .env so DATABASE_URL, OPENAI_API_KEY / FINN_API_KEY are available
 _env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=_env_path)
+_root_env = Path(__file__).resolve().parent.parent / ".env"
+if _root_env.exists():
+    load_dotenv(dotenv_path=_root_env)
 
 # Ensure project root is on path so rag_context can be imported when judge_core is used from server or elsewhere
 _root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -22,8 +25,13 @@ from rag_context.top_k_retrieval import (
     _split_case_card_main_and_addendum,
 )
 
-# The SDK reads OPENAI_API_KEY from the environment automatically.
-client = OpenAI()
+# Use OPENAI_API_KEY or FINN_API_KEY (rag_context uses FINN_API_KEY in config)
+_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("FINN_API_KEY")
+if not _api_key:
+    raise RuntimeError(
+        "Set OPENAI_API_KEY or FINN_API_KEY in .env (e.g. backend_model/.env or project root .env)"
+    )
+client = OpenAI(api_key=_api_key)
 
 
 def parse_top_k_retrieval_dict_to_prompt_context(top_k_retrieval: Dict[str, Any] | None) -> str:
