@@ -1,4 +1,4 @@
-import { Copy, Check, AlertTriangle, Scale, FileText } from 'lucide-react';
+import { Copy, Check, AlertTriangle, Scale, FileText, Clock3 } from 'lucide-react';
 import { useState } from 'react';
 import type { JudgeCaseResponse } from '@/lib/api';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -84,6 +84,12 @@ const getCopyText = (result: JudgeCaseResponse) => {
   const parts = [
     result.case_summary ? `Case Summary\n${stripRetrievalBlock(result.case_summary)}` : '',
     result.case_decision ? `Case Decision\n${stripRetrievalBlock(result.case_decision)}` : '',
+    result.oral_argument_prediction
+      ? `Oral Argument Prediction\n${result.oral_argument_prediction}`
+      : '',
+    result.oral_argument_summary
+      ? `Oral Argument Justification\n${result.oral_argument_summary}`
+      : '',
   ].filter(Boolean);
   const rawFallback = result.raw ? stripRetrievalBlock(result.raw) : '';
   return parts.join('\n\n') || rawFallback || '';
@@ -133,6 +139,12 @@ export const OutputDisplay = ({ result, error, isLoading }: OutputDisplayProps) 
 
   const similarCases = Array.isArray(result.similar_cases) ? result.similar_cases : [];
   const hasStructuredResponse = Boolean(result.case_summary || result.case_decision);
+  const hasOralArgumentData = Boolean(
+    result.oral_argument_prediction ||
+      result.oral_argument_summary ||
+      result.oral_argument_raw ||
+      result.oral_argument_error,
+  );
 
   return (
     <div className="space-y-4 fade-in">
@@ -198,6 +210,52 @@ export const OutputDisplay = ({ result, error, isLoading }: OutputDisplayProps) 
             <p className="text-sm leading-6 whitespace-pre-wrap">
               {stripRetrievalBlock(result.case_decision)}
             </p>
+          </CardContent>
+        </Card>
+      )}
+
+      {hasOralArgumentData && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base flex items-center gap-2">
+              <Clock3 className="w-4 h-4 text-primary" />
+              Oral Argument Prediction
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {result.oral_argument_prediction ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-medium text-foreground">Predicted allocation:</span>
+                <Badge variant="secondary">{result.oral_argument_prediction}</Badge>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                No oral argument allocation was parsed from the model response.
+              </p>
+            )}
+
+            {result.oral_argument_summary && (
+              <p className="text-sm leading-6 whitespace-pre-wrap">{result.oral_argument_summary}</p>
+            )}
+
+            {result.oral_argument_error && (
+              <Alert>
+                <AlertTriangle className="h-4 w-4" />
+                <AlertTitle>Oral argument prediction warning</AlertTitle>
+                <AlertDescription>{result.oral_argument_error}</AlertDescription>
+              </Alert>
+            )}
+
+            {!result.oral_argument_prediction && !result.oral_argument_summary && result.oral_argument_raw && (
+              <details className="rounded-md border p-2">
+                <summary className="cursor-pointer text-sm font-medium text-foreground">
+                  View raw oral argument output
+                </summary>
+                <pre className="mt-2 text-sm whitespace-pre-wrap break-words max-h-[320px] overflow-auto">
+                  {result.oral_argument_raw}
+                </pre>
+              </details>
+            )}
           </CardContent>
         </Card>
       )}

@@ -41,7 +41,13 @@ DEFAULT_CANDIDATE_CHUNKS = 80          # legacy; overridden when RetrievalConfig
 DEFAULT_MAX_CHUNKS_PER_CASE = 4        # legacy
 DEFAULT_CHUNK_CAP = 3
 DEFAULT_DECAY = 0.85
-DEFAULT_WEIGHTS = {"embed": 0.65, "doctrine": 0.20, "statute": 0.10, "posture": 0.05}
+DEFAULT_WEIGHTS = {
+    "embed": 0.50,
+    "doctrine": 0.20,
+    "statute": 0.10,
+    "posture": 0.05,
+    "standard_of_review": 0.15,
+}
 
 
 @dataclass
@@ -56,6 +62,7 @@ class RetrievalConfig:
     w_doctrine: float = DEFAULT_WEIGHTS["doctrine"]
     w_statute: float = DEFAULT_WEIGHTS["statute"]
     w_posture: float = DEFAULT_WEIGHTS["posture"]
+    w_standard_of_review: float = DEFAULT_WEIGHTS["standard_of_review"]
     chunks_per_candidate: int = 5      # heuristic multiplier for fetch count
 
 
@@ -76,6 +83,7 @@ class QuerySignals:
     case_type: Optional[str] = None
     procedural_posture: Optional[str] = None
     posture_bucket: Optional[str] = None
+    standards_of_review: List[str] = field(default_factory=list)
     statute_tags: List[str] = field(default_factory=list)
     doctrine_tags: List[str] = field(default_factory=list)
     issue_tags: List[str] = field(default_factory=list)
@@ -88,6 +96,7 @@ class ScoreBreakdown:
     doctrine: float
     statute: float
     posture: float
+    standard_of_review: float
     raw_embed_agg: float
 
 
@@ -269,6 +278,7 @@ _DOCTRINE_KEYWORDS = [
 
 _ISSUE_KEYWORDS = [
     "prison conditions", "medical care", "use of force",
+    "medical needs", "serious medical needs",
     "first amendment", "free speech", "religious exercise",
     "search and seizure", "miranda", "confrontation clause",
     "speedy trial", "double jeopardy", "self-incrimination",
@@ -279,6 +289,50 @@ _ISSUE_KEYWORDS = [
     "wrongful death", "personal injury", "malpractice",
     "immigration relief", "asylum", "cancellation of removal",
 ]
+
+
+_STANDARD_OF_REVIEW_KEYWORDS = [
+    "de novo",
+    "abuse of discretion",
+    "clear error",
+    "plain error",
+    "substantial evidence",
+    "arbitrary and capricious",
+    "harmless error",
+]
+
+
+def _normalize_standard_of_review(raw: str) -> str:
+    return re.sub(r"\s+", " ", (raw or "").strip().lower())
+
+
+def _extract_standard_of_review_terms(
+    combined_lower: str,
+    llm_metadata: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    llm_metadata = llm_metadata or {}
+    raw = llm_metadata.get("standards_of_review") or llm_metadata.get("standard_of_review")
+    llm_terms: Set[str] = set()
+
+    if isinstance(raw, list):
+        llm_terms = {
+            _normalize_standard_of_review(str(item))
+            for item in raw
+            if str(item).strip()
+        }
+    elif isinstance(raw, str) and raw.strip():
+        split = re.split(r"[\n;,]+", raw)
+        llm_terms = {
+            _normalize_standard_of_review(item)
+            for item in split
+            if item.strip()
+        }
+
+    text_terms = {
+        kw for kw in _STANDARD_OF_REVIEW_KEYWORDS if kw in combined_lower
+    }
+
+    return sorted((llm_terms | text_terms) - {""})
 
 
 def extract_query_signals(
@@ -299,6 +353,7 @@ def extract_query_signals(
         case_type = _infer_case_type_from_text(combined_lower)
 
     posture = (llm_metadata or {}).get("procedural_posture")
+    standards_of_review = _extract_standard_of_review_terms(combined_lower, llm_metadata)
 
     # Prefer LLM-extracted tags when available; else fall back to regex/keywords
     llm_statutes = (llm_metadata or {}).get("statute_tags")
@@ -319,6 +374,7 @@ def extract_query_signals(
         case_type=case_type,
         procedural_posture=posture,
         posture_bucket=_bucketize_posture(posture),
+        standards_of_review=standards_of_review,
         statute_tags=statute_tags,
         doctrine_tags=doctrine_tags,
         issue_tags=issue_tags,
@@ -349,6 +405,11 @@ def build_query_fingerprint(
             signal_lines.append(f"CASE TYPE: {query_signals.case_type}")
         if query_signals.procedural_posture:
             signal_lines.append(f"PROCEDURAL POSTURE: {query_signals.procedural_posture}")
+        if query_signals.standards_of_review:
+            signal_lines.append(
+                "STANDARDS OF REVIEW: "
+                + "; ".join(query_signals.standards_of_review[:8])
+            )
         if query_signals.statute_tags:
             signal_lines.append(f"KEY STATUTES: {'; '.join(query_signals.statute_tags[:15])}")
         if query_signals.doctrine_tags:
@@ -473,10 +534,11 @@ def retrieve_top_k_case_cards(
     if query_signals:
         logger.info(
             "[retrieve_top_k_case_cards] query_signals case_type=%s posture=%s posture_bucket=%s "
-            "doctrines=%d statutes=%d issues=%d",
+            "sor=%d doctrines=%d statutes=%d issues=%d",
             query_signals.case_type,
             query_signals.procedural_posture,
             query_signals.posture_bucket,
+            len(query_signals.standards_of_review),
             len(query_signals.doctrine_tags),
             len(query_signals.statute_tags),
             len(query_signals.issue_tags),
@@ -568,6 +630,11 @@ def retrieve_top_k_case_cards(
     q_case_type = (
         _normalize_case_type(query_signals.case_type) if query_signals else None
     )
+    q_sor: Set[str] = {
+        _normalize_standard_of_review(t)
+        for t in (query_signals.standards_of_review if query_signals else [])
+        if t
+    }
 
     final_scores: Dict[str, float] = {}
     breakdowns: Dict[str, ScoreBreakdown] = {}
@@ -586,6 +653,14 @@ def retrieve_top_k_case_cards(
         c_posture_bucket = _bucketize_posture(meta.get("procedural_posture"))
         c_type = _normalize_case_type(meta.get("case_type"))
         candidate_types[cid] = c_type
+        candidate_text_for_sor = " ".join([
+            str(meta.get("case_card_text") or ""),
+            str(meta.get("procedural_posture") or ""),
+            " ".join(meta.get("doctrine_tags") or []),
+        ]).lower()
+        c_sor = {
+            kw for kw in _STANDARD_OF_REVIEW_KEYWORDS if kw in candidate_text_for_sor
+        }
 
         doctrine_score = _jaccard(q_doctrines, c_doctrines)
         statute_score = _jaccard(q_statutes, c_statutes)
@@ -595,12 +670,14 @@ def retrieve_top_k_case_cards(
                 and q_posture_bucket == c_posture_bucket)
             else 0.0
         )
+        standard_of_review_score = _jaccard(q_sor, c_sor)
 
         combined = (
             cfg.w_embed * embed_score
             + cfg.w_doctrine * doctrine_score
             + cfg.w_statute * statute_score
             + cfg.w_posture * posture_score
+            + cfg.w_standard_of_review * standard_of_review_score
         )
         final_scores[cid] = combined
         breakdowns[cid] = ScoreBreakdown(
@@ -608,6 +685,7 @@ def retrieve_top_k_case_cards(
             doctrine=doctrine_score,
             statute=statute_score,
             posture=posture_score,
+            standard_of_review=standard_of_review_score,
             raw_embed_agg=raw_embed_agg.get(cid, 0.0),
         )
     logger.info(
@@ -716,6 +794,7 @@ def _build_retrieval_log(
                 "doctrine": round(bd.doctrine, 6),
                 "statute": round(bd.statute, 6),
                 "posture": round(bd.posture, 6),
+                "standard_of_review": round(bd.standard_of_review, 6),
                 "raw_embed_agg": round(bd.raw_embed_agg, 6),
             } if bd else None,
         }
@@ -733,6 +812,7 @@ def _build_retrieval_log(
                 "doctrine": cfg.w_doctrine,
                 "statute": cfg.w_statute,
                 "posture": cfg.w_posture,
+                "standard_of_review": cfg.w_standard_of_review,
             },
         },
         "query_signals": asdict(query_signals) if query_signals else None,
@@ -875,7 +955,8 @@ def retrieve_similar_cases_for_new_case(
     candidate_chunks: int = DEFAULT_CANDIDATE_CHUNKS,
     config: Optional[RetrievalConfig] = None,
     llm_metadata: Optional[Dict[str, Any]] = None,
-) -> List[RetrievedCaseCard]:
+    return_query_signals: bool = False,
+) -> List[RetrievedCaseCard] | Tuple[List[RetrievedCaseCard], QuerySignals]:
     """
     Full pipeline:
       - Extract query signals (regex, optionally LLM-augmented)
@@ -885,7 +966,7 @@ def retrieve_similar_cases_for_new_case(
     """
     if not briefs:
         logger.warning("[retrieve_similar_cases_for_new_case] No briefs provided; returning [].")
-        return []
+        return ([], QuerySignals()) if return_query_signals else []
 
     cfg = config or RetrievalConfig(k=k)
     logger.info(
@@ -902,10 +983,11 @@ def retrieve_similar_cases_for_new_case(
     )
     logger.info(
         "[retrieve_similar_cases_for_new_case] extracted signals case_type=%s posture=%s "
-        "posture_bucket=%s doctrines=%d statutes=%d issues=%d",
+        "posture_bucket=%s sor=%d doctrines=%d statutes=%d issues=%d",
         signals.case_type,
         signals.procedural_posture,
         signals.posture_bucket,
+        len(signals.standards_of_review),
         len(signals.doctrine_tags),
         len(signals.statute_tags),
         len(signals.issue_tags),
@@ -936,6 +1018,8 @@ def retrieve_similar_cases_for_new_case(
         len(results),
         [r.case_id for r in results],
     )
+    if return_query_signals:
+        return results, signals
     return results
 
 
@@ -968,7 +1052,8 @@ def retrieve_similar_cases_from_pdf_uploads(
     k: int = DEFAULT_K,
     candidate_chunks: int = DEFAULT_CANDIDATE_CHUNKS,
     config: Optional[RetrievalConfig] = None,
-) -> List[RetrievedCaseCard]:
+    return_query_signals: bool = False,
+) -> List[RetrievedCaseCard] | Tuple[List[RetrievedCaseCard], QuerySignals]:
     """
     Version of retrieve_similar_cases_for_new_case for frontend PDF uploads
     (e.g. drag-and-drop). Accepts a list of (label, pdf_bytes) pairs; each
@@ -986,7 +1071,7 @@ def retrieve_similar_cases_from_pdf_uploads(
     """
     if not uploads:
         logger.warning("[retrieve_similar_cases_from_pdf_uploads] No uploads provided; returning [].")
-        return []
+        return ([], QuerySignals()) if return_query_signals else []
 
     url = db_url or DATABASE_URL
     briefs: List[BriefInput] = []
@@ -1022,19 +1107,26 @@ def retrieve_similar_cases_from_pdf_uploads(
             len(llm_metadata.get("statute_tags") or []),
         )
 
-    results = retrieve_similar_cases_for_new_case(
+    retrieval_result = retrieve_similar_cases_for_new_case(
         db_url=url,
         briefs=briefs,
         k=k,
         candidate_chunks=candidate_chunks,
         config=config,
         llm_metadata=llm_metadata,
+        return_query_signals=return_query_signals,
     )
+    if return_query_signals:
+        results, signals = retrieval_result
+    else:
+        results = retrieval_result
     logger.info(
         "[retrieve_similar_cases_from_pdf_uploads] end results_count=%d result_case_ids=%s",
         len(results),
         [r.case_id for r in results],
     )
+    if return_query_signals:
+        return results, signals
     return results
 
 
@@ -1184,6 +1276,8 @@ def main() -> None:
 
         # Query signals summary
         print(f"  Query signals: type={signals.case_type}, posture_bucket={signals.posture_bucket}")
+        if signals.standards_of_review:
+            print(f"    standards_of_review: {signals.standards_of_review[:5]}")
         if signals.doctrine_tags:
             print(f"    doctrines: {signals.doctrine_tags[:5]}")
         if signals.statute_tags:
@@ -1240,6 +1334,7 @@ def main() -> None:
                 bd = r.score_breakdown
                 print(f"      breakdown: embed={bd.embed:.4f}  doctrine={bd.doctrine:.4f}"
                       f"  statute={bd.statute:.4f}  posture={bd.posture:.4f}"
+                      f"  sor={bd.standard_of_review:.4f}"
                       f"  raw_agg={bd.raw_embed_agg:.4f}")
 
             card = (r.case_card_text or "").strip()

@@ -12,15 +12,18 @@ import pdfplumber
 DEFAULT_MODEL_NAME = "gpt-5.2"
 MODEL_NAME = DEFAULT_MODEL_NAME
 
-ENV_PATH = Path(__file__).resolve().parent / ".env"
-print("Loading .env from:", ENV_PATH)
+_env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=_env_path)
+_root_env = Path(__file__).resolve().parent.parent / ".env"
+if _root_env.exists():
+    load_dotenv(dotenv_path=_root_env)
 
-load_dotenv(dotenv_path=ENV_PATH, override=True)
-
-api_key = os.getenv("OPENAI_API_KEY")
+api_key = os.getenv("OPENAI_API_KEY") or os.getenv("FINN_API_KEY")
 
 if not api_key:
-    raise RuntimeError("OPENAI_API_KEY not found after loading .env")
+    raise RuntimeError(
+        "Set OPENAI_API_KEY or FINN_API_KEY in .env (e.g. backend_model/.env or project root .env)"
+    )
 
 client = OpenAI(api_key=api_key)
 
@@ -86,48 +89,64 @@ Please structure your response EXACTLY as follows (do not add any text before th
 """
 
 # ---------------------------------------------------------------------------
-# PROMPT 2: Predicts ORAL ARGUMENT PER SIDE + CASE SUMMARY
-# Injects a standard of review / complexity framework document.
+# PROMPT 2: Predicts ORAL ARGUMENT LENGTH PER SIDE + LENGTH RATIONALE
+# Requires extracted query signals plus standard-of-review framework text.
 # ---------------------------------------------------------------------------
 PROMPT_2_TEMPLATE = """
-You are serving as an appellate judge reviewing an appellate case which includes {num_docs} document(s).
+You are serving as an appellate judge assigning oral-argument time in an appellate case with {num_docs} document(s).
 
-CRITICAL INSTRUCTIONS:
-- You must PREDICT the outcome based ONLY on the legal arguments, facts, and law presented in these documents.
-- DO NOT use any external knowledge about this case, parties, or docket number.
-- Treat this as if YOU are the appellate court making the decision for the first time.
+PRIMARY OBJECTIVE:
+- Predict the appropriate oral argument length per side.
+- Focus only on oral-argument time allocation and the factors that drive it.
+- Do not predict case disposition in this task.
 
-The documents may include:
-- Appellant's brief (arguing the lower court was wrong)
-- Appellee's brief (defending the lower court decision)
-- Reply briefs
-- Addendums with relevant statutes, exhibits, or the lower court's decision
+SOURCE LIMITS:
+- Use only the uploaded case materials, the extracted query signals below, and the standard-of-review framework below.
+- Do not use outside knowledge about this case, parties, docket number, or real-world outcome.
+
+---
+EXTRACTED QUERY SIGNALS (CASE-SPECIFIC)
+{extracted_query_signals}
+---
 
 ---
 ORAL ARGUMENT STANDARD OF REVIEW — COMPLEXITY & TIME ALLOCATION GUIDELINES
 {standard_of_review}
 ---
 
+TIME-ALLOCATION ANALYSIS RULES:
+1. Start with extracted query signals as primary predictors, with highest weight on:
+   - case_type
+   - standard_of_review
+   -issue_tags
+2. Apply this presumption unless the case documents strongly rebut it:
+   - Civil appeals are substantially more likely to receive oral argument than criminal appeals.
+3. Use standard-of-review and complexity-tier guidance to adjust the recommendation up or down.
+4. Decide between:
+   - oral argument occurs (recommend one concrete per-side duration), or
+   - no oral argument occurs.
+5. If evidence conflicts, explain which factors control and why.
+
 Your task is to produce TWO outputs:
 
 **OUTPUT 1: ORAL ARGUMENT PER SIDE**
-- Recommend a single oral argument time allocation per side based on the legal complexity of the case.
-- Express as a human-readable duration string, e.g. "10 minutes", "15 minutes", "30 minutes", "1 hour".
-- Base this recommendation on the complexity tier framework provided above.
+- Return exactly one of:
+  - a duration string for each side, e.g. "10 minutes", "15 minutes", "30 minutes", or "1 hour"
+  - "NO ORAL ARGUMENT"
 
-**OUTPUT 2: CASE SUMMARY DOCUMENT (PREDICTIVE)**
-Predict and provide:
-1. A brief 3-5 sentence summary of the key legal issues on appeal.
-2. Statement of the lower court's decision (what ruling is being appealed from).
-3. An explanation of the case complexity and your reasoning for the oral argument time recommendation.
+**OUTPUT 2: ORAL ARGUMENT LENGTH JUSTIFICATION**
+Provide a concise 4-7 sentence explanation that includes:
+1. How case_type and issue_tags shaped the decision.
+2. The chosen complexity tier (if oral argument is recommended) and why.
+3. How the standard-of-review guidance supports either the selected duration or no-argument outcome.
 
 Please structure your response EXACTLY as follows (do not add any text before the first delimiter):
 
 ===ORAL ARGUMENT PER SIDE===
-[Duration string only — e.g. 15 minutes]
+[Duration string only — e.g. 15 minutes — OR exactly: NO ORAL ARGUMENT]
 
 ===CASE SUMMARY===
-[Your full predicted case summary here]
+[Your oral-argument-length justification only]
 """
 
 # ---------------------------------------------------------------------------
@@ -601,6 +620,7 @@ def process_case_directory(case_dir, redact=False, conv_to_text=False):
 
     prompt_2 = PROMPT_2_TEMPLATE.format(
         num_docs=num_docs,
+        extracted_query_signals="No extracted query signals were provided for this case.",
         standard_of_review=STANDARD_OF_REVIEW_PLACEHOLDER
     )
 

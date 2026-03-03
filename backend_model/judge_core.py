@@ -107,25 +107,69 @@ def parse_top_k_retrieval_dict_to_prompt_context(top_k_retrieval: Dict[str, Any]
     return "\n\n".join(blocks)
 
 
+def parse_query_signals_to_prompt_context(top_k_retrieval: Dict[str, Any] | None) -> str:
+    """
+    Convert query_signals from get_top_k_retrieval_for_uploaded_pdfs into
+    prompt-ready text for outcome reasoning.
+    """
+    if not top_k_retrieval:
+        return "No query signals were provided."
+
+    query_signals = top_k_retrieval.get("query_signals")
+    if not isinstance(query_signals, dict) or not query_signals:
+        return "No query signals were returned by retrieval."
+
+    case_type = query_signals.get("case_type") or "unknown"
+    posture = query_signals.get("procedural_posture") or "unknown"
+    posture_bucket = query_signals.get("posture_bucket") or "unknown"
+
+    standards = query_signals.get("standards_of_review") or []
+    statutes = query_signals.get("statute_tags") or []
+    doctrines = query_signals.get("doctrine_tags") or []
+    issues = query_signals.get("issue_tags") or []
+
+    standards_text = ", ".join(standards) if standards else "none"
+    statutes_text = ", ".join(statutes) if statutes else "none"
+    doctrines_text = ", ".join(doctrines) if doctrines else "none"
+    issues_text = ", ".join(issues) if issues else "none"
+
+    return (
+        "[Query Signals]\n"
+        f"- case_type: {case_type}\n"
+        f"- procedural_posture: {posture}\n"
+        f"- posture_bucket: {posture_bucket}\n"
+        f"- standards_of_review: {standards_text}\n"
+        f"- statute_tags: {statutes_text}\n"
+        f"- doctrine_tags: {doctrines_text}\n"
+        f"- issue_tags: {issues_text}"
+    )
+
+
 def build_prediction_prompt_with_retrieval_context(
     prompt_text: str,
     top_k_retrieval: Dict[str, Any] | None,
 ) -> str:
     """Inject retrieved-case context into the user prompt in a structured way."""
     retrieved_context = parse_top_k_retrieval_dict_to_prompt_context(top_k_retrieval)
+    query_signals_context = parse_query_signals_to_prompt_context(top_k_retrieval)
     return (
         f"{prompt_text.strip()}\n\n"
+        "===QUERY_SIGNALS_ANALYZED===\n"
+        "These structured signals were extracted from the uploaded case materials by the retrieval pipeline.\n"
+        "Treat them as case-specific anchors for your reasoning about likely outcome.\n\n"
+        f"{query_signals_context}\n\n"
         "===TOP_K_RETRIEVED_CASES===\n"
         "The following cases are top-k semantically related prior cases retrieved from an internal corpus.\n"
         "Use them as persuasive comparative context only; do not treat them as binding authority unless\n"
         "supported by law in the uploaded briefs.\n\n"
         f"{retrieved_context}\n\n"
-        "===INSTRUCTIONS_FOR_USING_TOP_K_CASES===\n"
-        "In your final prediction, explicitly incorporate these retrieved cases by:\n"
-        "1) Comparing fact patterns, issues, and procedural posture to the current appeal.\n"
-        "2) Explaining whether those analogies support or cut against each potential disposition.\n"
-        "3) Prioritizing the uploaded documents whenever there is tension with retrieved-case context.\n"
-        "4) Grounding the final outcome in the uploaded record, while using top-k cases to improve legal reasoning.\n"
+        "===INSTRUCTIONS_FOR_USING_QUERY_SIGNALS_AND_TOP_K_CASES===\n"
+        "In your final prediction, explicitly incorporate both query signals and retrieved cases by:\n"
+        "1) Citing the query signals (case type, posture, standards, doctrine/statute/issue tags) as part of your outcome analysis.\n"
+        "2) Comparing retrieved-case analogies against those query signals and the uploaded briefs.\n"
+        "3) Explaining whether each key signal supports or cuts against the predicted disposition.\n"
+        "4) Including a short subsection in ===CASE DECISION=== titled 'Use of Query Signals and Retrieved Cases'.\n"
+        "5) Prioritizing the uploaded documents whenever there is tension with either query signals or retrieved-case context.\n"
     )
 
 
@@ -150,6 +194,15 @@ def get_top_k_retrieval_for_uploaded_pdfs(
     Returns:
         Nested dict suitable for JSON serialization, with structure:
         {
+          "query_signals": {
+            "case_type": str | null,
+            "procedural_posture": str | null,
+            "posture_bucket": str | null,
+            "standards_of_review": list[str],
+            "statute_tags": list[str],
+            "doctrine_tags": list[str],
+            "issue_tags": list[str]
+          },
           "retrieved_cases": [
             {
               "case_id": str,
@@ -172,7 +225,11 @@ def get_top_k_retrieval_for_uploaded_pdfs(
     if candidate_chunks is not None:
         kwargs["candidate_chunks"] = candidate_chunks
 
-    cards = retrieve_similar_cases_from_pdf_uploads(uploads, **kwargs)
+    cards, query_signals = retrieve_similar_cases_from_pdf_uploads(
+        uploads,
+        return_query_signals=True,
+        **kwargs,
+    )
 
     retrieved_cases: List[Dict[str, Any]] = []
     for card in cards:
@@ -194,7 +251,10 @@ def get_top_k_retrieval_for_uploaded_pdfs(
         }
         retrieved_cases.append(entry)
 
-    return {"retrieved_cases": retrieved_cases}
+    return {
+        "query_signals": asdict(query_signals),
+        "retrieved_cases": retrieved_cases,
+    }
 
 
 def run_prediction_with_uploaded_pdfs(

@@ -2,6 +2,10 @@ export interface JudgeCaseResponse {
   raw?: string;
   case_summary?: string | null;
   case_decision?: string | null;
+  oral_argument_raw?: string | null;
+  oral_argument_prediction?: string | null;
+  oral_argument_summary?: string | null;
+  oral_argument_error?: string | null;
   num_documents?: number;
   retrieval_k?: number;
   similar_cases?: unknown[];

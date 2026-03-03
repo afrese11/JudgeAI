@@ -188,7 +188,11 @@ class TestExtractSignals:
         assert any("1983" in t for t in signals.statute_tags)
         assert "qualified immunity" in signals.doctrine_tags
         assert "cruel and unusual" in signals.doctrine_tags
-        assert "prison conditions" in signals.issue_tags or "medical care" in signals.issue_tags
+        assert (
+            "prison conditions" in signals.issue_tags
+            or "medical care" in signals.issue_tags
+            or "medical needs" in signals.issue_tags
+        )
 
     def test_criminal_signals(self):
         text = (
@@ -202,11 +206,17 @@ class TestExtractSignals:
 
     def test_llm_metadata_override(self):
         text = "some ambiguous text"
-        meta = {"case_type": "civil", "procedural_posture": "summary judgment"}
+        meta = {
+            "case_type": "civil",
+            "procedural_posture": "summary judgment",
+            "standards_of_review": ["de novo", "abuse of discretion"],
+        }
         signals = extract_query_signals([text], llm_metadata=meta)
         assert signals.case_type == "civil"
         assert signals.procedural_posture == "summary judgment"
         assert signals.posture_bucket == "summary_judgment"
+        assert "de novo" in signals.standards_of_review
+        assert "abuse of discretion" in signals.standards_of_review
 
 
 # ─────────────────────────────────────────────
@@ -217,6 +227,7 @@ class TestFingerprint:
     def test_includes_signals(self):
         signals = QuerySignals(
             case_type="civil",
+            standards_of_review=["de novo"],
             statute_tags=["42 U.S.C. § 1983"],
             doctrine_tags=["qualified immunity"],
         )
@@ -225,6 +236,7 @@ class TestFingerprint:
             query_signals=signals,
         )
         assert "CASE TYPE: civil" in fp
+        assert "STANDARDS OF REVIEW: de novo" in fp
         assert "42 U.S.C. § 1983" in fp
         assert "qualified immunity" in fp
 
@@ -264,7 +276,7 @@ class TestReranking:
             {
                 "case_id": "B", "case_type": "civil",
                 "procedural_posture": "summary judgment",
-                "case_card_text": "Case B card",
+                "case_card_text": "Case B card. Standard of review is de novo.",
                 "issue_tags": [], "statute_tags": ["42 U.S.C. § 1983"],
                 "doctrine_tags": ["qualified immunity", "deliberate indifference"],
             },
@@ -272,6 +284,7 @@ class TestReranking:
         conn = _make_mock_conn(chunk_rows, meta_rows)
         signals = QuerySignals(
             case_type="civil",
+            standards_of_review=["de novo"],
             doctrine_tags=["qualified immunity", "deliberate indifference"],
             statute_tags=["42 U.S.C. § 1983"],
         )
@@ -281,6 +294,44 @@ class TestReranking:
         )
         assert len(results) == 2
         assert results[0].case_id == "B"
+
+    def test_standard_of_review_overlap_boost(self):
+        """Standard-of-review overlap should break near-ties in favor of overlap."""
+        chunk_rows = [
+            {"case_id": "S1", "chunk_id": "s1a", "sim": 0.86},
+            {"case_id": "S2", "chunk_id": "s2a", "sim": 0.85},
+        ]
+        meta_rows = [
+            {
+                "case_id": "S1",
+                "case_type": "civil",
+                "procedural_posture": "appeal from summary judgment",
+                "case_card_text": "Case S1.",
+                "issue_tags": [],
+                "statute_tags": [],
+                "doctrine_tags": [],
+            },
+            {
+                "case_id": "S2",
+                "case_type": "civil",
+                "procedural_posture": "appeal from summary judgment",
+                "case_card_text": "Case S2. The applicable standard of review is de novo.",
+                "issue_tags": [],
+                "statute_tags": [],
+                "doctrine_tags": [],
+            },
+        ]
+        conn = _make_mock_conn(chunk_rows, meta_rows)
+        signals = QuerySignals(
+            case_type="civil",
+            standards_of_review=["de novo"],
+        )
+        cfg = RetrievalConfig(k=2)
+        results = retrieve_top_k_case_cards(
+            conn, [0.0] * 1536, k=2, config=cfg, query_signals=signals,
+        )
+        assert len(results) == 2
+        assert results[0].case_id == "S2"
 
     def test_statute_overlap_soft_boost(self):
         """Statute overlap should boost Y above X when embed scores are close."""
@@ -566,6 +617,7 @@ class TestEndToEndCivil1983:
         signals = QuerySignals(
             case_type="civil",
             posture_bucket="summary_judgment",
+            standards_of_review=["de novo"],
             statute_tags=["42 U.S.C. § 1983"],
             doctrine_tags=["qualified immunity"],
         )
@@ -581,6 +633,7 @@ class TestEndToEndCivil1983:
             + cfg.w_doctrine * bd.doctrine
             + cfg.w_statute * bd.statute
             + cfg.w_posture * bd.posture
+            + cfg.w_standard_of_review * bd.standard_of_review
         )
         assert abs(r.score - expected) < 1e-6
 

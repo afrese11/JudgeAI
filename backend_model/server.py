@@ -4,6 +4,8 @@ import sys
 import tempfile
 import logging
 import importlib
+import json
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import httpx
@@ -15,6 +17,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from judge_core import (
     get_top_k_retrieval_for_uploaded_pdfs,
     run_prediction_with_uploaded_pdfs,
+)
+from blackbox_predictor_gpt5 import (
+    PROMPT_2_TEMPLATE,
+    STANDARD_OF_REVIEW_PLACEHOLDER,
+    call_gpt_with_content,
+    parse_response,
 )
 
 # Ensure project root is on path so rag_context can be imported (e.g. when run from backend_model)
@@ -223,6 +231,7 @@ async def judge_case(
             logger.exception("[judge] Retrieval failed")
 
         similar_cases = top_k_retrieval.get("retrieved_cases", [])
+        query_signals = top_k_retrieval.get("query_signals", {})
 
         prompt = PROMPT_TEMPLATE.format(
             num_docs=len(tmp_paths),
@@ -253,13 +262,55 @@ async def judge_case(
             bool(case_decision),
         )
 
+        oral_argument_raw = None
+        oral_argument_per_side = None
+        oral_argument_summary = None
+        oral_argument_error = None
+
+        try:
+            extracted_query_signals = (
+                json.dumps(query_signals, indent=2)
+                if isinstance(query_signals, dict) and query_signals
+                else "No extracted query signals were provided for this case."
+            )
+            prompt_2 = PROMPT_2_TEMPLATE.format(
+                num_docs=len(tmp_paths),
+                extracted_query_signals=extracted_query_signals,
+                standard_of_review=STANDARD_OF_REVIEW_PLACEHOLDER,
+            )
+            logger.info("[judge] Calling call_gpt_with_content for oral argument prediction")
+            oral_argument_raw = call_gpt_with_content(
+                prompt=prompt_2,
+                pdf_files=[Path(p) for p in tmp_paths],
+                combined_content="__FILE_UPLOAD__",
+                conv_to_text=False,
+            )
+            oral_argument_per_side, oral_argument_summary = parse_response(
+                oral_argument_raw,
+                "===ORAL ARGUMENT PER SIDE===",
+                "===CASE SUMMARY===",
+            )
+            logger.info(
+                "[judge] Parsed oral argument response: has_duration=%s has_justification=%s",
+                bool(oral_argument_per_side),
+                bool(oral_argument_summary),
+            )
+        except Exception as e:
+            oral_argument_error = f"{type(e).__name__}: {str(e)}"
+            logger.exception("[judge] Oral argument prediction failed")
+
         return {
             "raw": raw,
             "case_summary": case_summary,
             "case_decision": case_decision,
+            "oral_argument_raw": oral_argument_raw,
+            "oral_argument_prediction": oral_argument_per_side,
+            "oral_argument_summary": oral_argument_summary,
+            "oral_argument_error": oral_argument_error,
             "num_documents": len(tmp_paths),
             "retrieval_k": retrieval_k,
             "similar_cases": similar_cases,
+            "query_signals": query_signals,
             "retrieval_error": retrieval_error,
             "redact": redact,
             "model": model,
