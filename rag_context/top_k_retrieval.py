@@ -330,6 +330,8 @@ def build_query_fingerprint(
     """
     parts: List[str] = ["LEGAL CASE RETRIEVAL FINGERPRINT", ""]
 
+
+    # FRONTLOAD important query signals at the START of our fingerprint
     if query_signals:
         signal_lines: List[str] = []
         if query_signals.case_type:
@@ -1077,17 +1079,23 @@ def main() -> None:
             # Build LLM metadata dict from DB or OpenAI
             llm_meta: Optional[Dict[str, Any]] = None
             llm_summary: Optional[Dict[str, Any]] = None
+            
+            # first check if case exists in the database
             if case_meta:
                 llm_meta = {
                     "case_type": case_meta.get("case_type"),
                     "procedural_posture": case_meta.get("procedural_posture"),
                 }
+                
+            # if not, combine all briefs into one string, use the LLM to turn the raw text
+            # into metadata + a short narrative summary
             elif not (analyzed_summary and analyzed_summary.strip()):
                 combined_brief = "\n\n".join(b.text[:20_000] for b in briefs)
                 llm_summary = summarize_analyzed_case_from_briefs(combined_brief)
                 llm_meta = llm_summary
 
             # Extract query signals
+            #once we have the metadata from summarize_analyzed_case_from_briefs, we can extract the query signals
             signals = extract_query_signals(
                 [b.text for b in briefs], llm_metadata=llm_meta,
             )
