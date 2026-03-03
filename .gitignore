@@ -15,3 +15,6 @@
 rag_context/AIth Circuit Test Dataset/
 rag_context/sept. 2024 decisions/
 philoai
+
+__pycache__/
+*.pyc

@@ -300,8 +300,19 @@ def extract_query_signals(
 
     posture = (llm_metadata or {}).get("procedural_posture")
 
-    statute_tags = sorted({m.strip() for m in _STATUTE_RE.findall(combined)} - {""})
-    doctrine_tags = sorted({kw for kw in _DOCTRINE_KEYWORDS if kw in combined_lower})
+    # Prefer LLM-extracted tags when available; else fall back to regex/keywords
+    llm_statutes = (llm_metadata or {}).get("statute_tags")
+    llm_doctrines = (llm_metadata or {}).get("doctrine_tags")
+    statute_tags = (
+        sorted({str(t).strip().lower() for t in llm_statutes if t})
+        if isinstance(llm_statutes, list) and llm_statutes
+        else sorted({m.strip() for m in _STATUTE_RE.findall(combined)} - {""})
+    )
+    doctrine_tags = (
+        sorted({str(t).strip().lower() for t in llm_doctrines if t})
+        if isinstance(llm_doctrines, list) and llm_doctrines
+        else sorted({kw for kw in _DOCTRINE_KEYWORDS if kw in combined_lower})
+    )
     issue_tags = sorted({kw for kw in _ISSUE_KEYWORDS if kw in combined_lower})
 
     return QuerySignals(
@@ -805,11 +816,13 @@ def summarize_analyzed_case_from_briefs(brief_text: str) -> Optional[Dict[str, A
     client = OpenAI(api_key=API_KEY)
     model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
-    prompt = """From the following litigation brief(s) text, extract and return a JSON object with exactly these keys (use empty string if unclear):
+    prompt = """From the following litigation brief(s) text, extract and return a JSON object with exactly these keys (use empty string or empty array if unclear):
 - case_type: e.g. civil, criminal, administrative, appeal; party names or court if evident
 - procedural_posture: e.g. appeal from district court, motion to dismiss, summary judgment
 - summary: 2-4 sentence summary of the dispute, key facts, and main issues
 - standards_of_review: brief list of applicable standards (e.g. de novo, abuse of discretion, clear error)
+- doctrine_tags: array of legal doctrines or tests mentioned (e.g. qualified immunity, Chevron deference, standing, deliberate indifference)
+- statute_tags: array of cited statutes or rules (e.g. "42 U.S.C. § 1983", "First Amendment", "Fed. R. Civ. P. 12")
 
 Return only valid JSON, no markdown or explanation."""
 
@@ -834,11 +847,17 @@ Return only valid JSON, no markdown or explanation."""
             standards_of_review = "\n".join(str(x).strip() for x in raw_sor if x)
         else:
             standards_of_review = (raw_sor or "").strip() or None
+        raw_doctrine = data.get("doctrine_tags")
+        doctrine_tags = [str(x).strip() for x in raw_doctrine if x] if isinstance(raw_doctrine, list) else []
+        raw_statute = data.get("statute_tags")
+        statute_tags = [str(x).strip() for x in raw_statute if x] if isinstance(raw_statute, list) else []
         return {
             "case_type": (data.get("case_type") or "").strip() or None,
             "procedural_posture": (data.get("procedural_posture") or "").strip() or None,
             "summary": (data.get("summary") or "").strip() or None,
             "standards_of_review": standards_of_review,
+            "doctrine_tags": doctrine_tags,
+            "statute_tags": statute_tags,
         }
     except (json.JSONDecodeError, KeyError, Exception):
         return None
@@ -991,12 +1010,25 @@ def retrieve_similar_cases_from_pdf_uploads(
             _preview(text),
         )
 
+    # Extract metadata from briefs via LLM so Doctrine/Statute/Posture scores can be computed
+    combined_text = "\n\n".join(b.text for b in briefs)[:50_000]
+    llm_metadata = summarize_analyzed_case_from_briefs(combined_text)
+    if llm_metadata:
+        logger.info(
+            "[retrieve_similar_cases_from_pdf_uploads] llm_metadata case_type=%s posture=%s doctrines=%d statutes=%d",
+            llm_metadata.get("case_type"),
+            llm_metadata.get("procedural_posture"),
+            len(llm_metadata.get("doctrine_tags") or []),
+            len(llm_metadata.get("statute_tags") or []),
+        )
+
     results = retrieve_similar_cases_for_new_case(
         db_url=url,
         briefs=briefs,
         k=k,
         candidate_chunks=candidate_chunks,
         config=config,
+        llm_metadata=llm_metadata,
     )
     logger.info(
         "[retrieve_similar_cases_from_pdf_uploads] end results_count=%d result_case_ids=%s",
