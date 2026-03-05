@@ -287,7 +287,6 @@ export const OutputDisplay = ({ result, error, isLoading }: OutputDisplayProps) 
                   const issueTags = asStringArray(record.issue_tags);
                   const statuteTags = asStringArray(record.statute_tags);
                   const doctrineTags = asStringArray(record.doctrine_tags);
-                  const scoreBreakdown = getRecord(record.score_breakdown);
 
                   return (
                     <div className="mt-2 space-y-2">
@@ -307,15 +306,6 @@ export const OutputDisplay = ({ result, error, isLoading }: OutputDisplayProps) 
                       )}
 
                       {summary && <p className="text-sm leading-6 whitespace-pre-wrap">{summary}</p>}
-
-                      {scoreBreakdown && (
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 rounded-md border bg-background/70 p-2">
-                          {renderMetadataLine('Embed', asNumber(scoreBreakdown.embed))}
-                          {renderMetadataLine('Doctrine', asNumber(scoreBreakdown.doctrine))}
-                          {renderMetadataLine('Statute', asNumber(scoreBreakdown.statute))}
-                          {renderMetadataLine('Posture', asNumber(scoreBreakdown.posture))}
-                        </div>
-                      )}
                     </div>
                   );
                 })()}
