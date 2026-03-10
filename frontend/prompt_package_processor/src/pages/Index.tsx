@@ -18,7 +18,8 @@ const ALLOWED_SIGNUP_EMAILS = new Set([
 ]);
 
 const Index = () => {
-  const [files, setFiles] = useState<File[]>([]);
+  const [addendumFiles, setAddendumFiles] = useState<File[]>([]);
+  const [relatedFiles, setRelatedFiles] = useState<File[]>([]);
   const [result, setResult] = useState<JudgeCaseResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [redact, setRedact] = useState(false);
@@ -136,8 +137,8 @@ const Index = () => {
   };
 
   const handleAnalyze = async () => {
-    if (files.length === 0) {
-      setError('Add at least one PDF brief before running analysis.');
+    if (addendumFiles.length === 0) {
+      setError('Upload one addendum PDF before running analysis.');
       return;
     }
     if (!session?.access_token || !supabase) {
@@ -162,7 +163,8 @@ const Index = () => {
       }
 
       const response = await submitJudgeCase({
-        files,
+        caseAddendumFile: addendumFiles[0],
+        relatedFiles,
         redact,
         apiBase,
         accessToken: latestSession.access_token,
@@ -184,7 +186,7 @@ const Index = () => {
         <div className="text-center mb-10">
           <h1 className="text-3xl font-bold text-foreground mb-2">JudgeAI</h1>
           <p className="text-muted-foreground">
-            Drop related case briefs and get a concise structured analysis.
+            Upload one case addendum and optional related briefs for a concise structured analysis.
           </p>
         </div>
 
@@ -277,8 +279,20 @@ const Index = () => {
           ) : (
             <>
               <FileDropZone
-                files={files}
-                onFilesChange={setFiles}
+                files={addendumFiles}
+                onFilesChange={setAddendumFiles}
+                multiple={false}
+                title="Case Addendum (required)"
+                description="Upload exactly one PDF addendum document."
+                onValidationError={handleValidationError}
+                disabled={isLoading}
+              />
+              <FileDropZone
+                files={relatedFiles}
+                onFilesChange={setRelatedFiles}
+                multiple
+                title="Related Files (optional)"
+                description="Upload any additional PDF briefs or related documents."
                 onValidationError={handleValidationError}
                 disabled={isLoading}
               />
@@ -299,12 +313,12 @@ const Index = () => {
 
               <Button
                 onClick={handleAnalyze}
-                disabled={files.length === 0 || isLoading}
+                disabled={addendumFiles.length === 0 || isLoading}
                 className="w-full h-12 text-base font-medium glow-button"
                 size="lg"
               >
                 <Sparkles className="w-5 h-5 mr-2" />
-                {isLoading ? 'Analyzing briefs...' : 'Analyze Case Briefs'}
+                {isLoading ? 'Analyzing documents...' : 'Analyze Case'}
               </Button>
 
               <OutputDisplay result={result} error={error} isLoading={isLoading} />

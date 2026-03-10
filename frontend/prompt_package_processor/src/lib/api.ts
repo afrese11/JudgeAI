@@ -7,6 +7,8 @@ export interface JudgeCaseResponse {
   oral_argument_summary?: string | null;
   oral_argument_error?: string | null;
   num_documents?: number;
+  num_addendum_documents?: number;
+  num_related_documents?: number;
   retrieval_k?: number;
   similar_cases?: unknown[];
   retrieval_error?: string | null;
@@ -17,7 +19,8 @@ export interface JudgeCaseResponse {
 }
 
 interface SubmitJudgeCaseParams {
-  files: File[];
+  caseAddendumFile: File;
+  relatedFiles: File[];
   redact?: boolean;
   apiBase?: string;
   accessToken?: string;
@@ -27,7 +30,8 @@ const safeApiBase = (apiBase?: string) =>
   apiBase && apiBase.trim() ? apiBase.trim().replace(/\/+$/, "") : "";
 
 export async function submitJudgeCase({
-  files,
+  caseAddendumFile,
+  relatedFiles,
   redact = false,
   apiBase,
   accessToken,
@@ -35,8 +39,9 @@ export async function submitJudgeCase({
   const endpoint = `${safeApiBase(apiBase)}/api/judge`;
   const form = new FormData();
 
-  for (const file of files) {
-    form.append("files", file, file.name);
+  form.append("case_addendum_file", caseAddendumFile, caseAddendumFile.name);
+  for (const file of relatedFiles) {
+    form.append("related_files", file, file.name);
   }
   form.append("redact", String(redact));
 

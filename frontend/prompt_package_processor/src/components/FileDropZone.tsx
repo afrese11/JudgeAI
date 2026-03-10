@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { Upload, X, FileText } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
@@ -7,6 +7,9 @@ interface FileDropZoneProps {
   onFilesChange: (files: File[]) => void;
   disabled?: boolean;
   onValidationError?: (message: string) => void;
+  multiple?: boolean;
+  title?: string;
+  description?: string;
 }
 
 const formatFileSize = (bytes: number) => {
@@ -38,8 +41,12 @@ export const FileDropZone = ({
   onFilesChange,
   disabled = false,
   onValidationError,
+  multiple = true,
+  title,
+  description,
 }: FileDropZoneProps) => {
   const [isDragActive, setIsDragActive] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
 
   const handleDrag = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -70,9 +77,16 @@ export const FileDropZone = ({
     }
 
     if (valid.length > 0) {
+      if (!multiple) {
+        if (valid.length > 1) {
+          onValidationError?.('Only one addendum PDF can be uploaded.');
+        }
+        onFilesChange(valid.slice(0, 1));
+        return;
+      }
       onFilesChange(uniqueFiles(files, valid));
     }
-  }, [files, onFilesChange, onValidationError]);
+  }, [files, multiple, onFilesChange, onValidationError]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -109,15 +123,15 @@ export const FileDropZone = ({
         onDrop={handleDrop}
         onClick={() => {
           if (!disabled) {
-            document.getElementById('file-input')?.click();
+            inputRef.current?.click();
           }
         }}
       >
         <input
-          id="file-input"
+          ref={inputRef}
           type="file"
           accept=".pdf,application/pdf"
-          multiple
+          multiple={multiple}
           disabled={disabled}
           className="hidden"
           onChange={handleFileInput}
@@ -127,11 +141,12 @@ export const FileDropZone = ({
             <Upload className="w-8 h-8 text-primary" />
           </div>
           <div className="text-center">
+            {title ? <p className="text-base font-semibold text-foreground mb-1">{title}</p> : null}
             <p className="text-lg font-medium text-foreground">
               {isDragActive ? 'Drop files here' : 'Drop files here or click to browse'}
             </p>
             <p className="text-sm text-muted-foreground mt-1">
-              PDF only, multi-file upload supported
+              {description || (multiple ? 'PDF only, multi-file upload supported' : 'PDF only, single-file upload')}
             </p>
           </div>
         </div>
