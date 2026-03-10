@@ -1,12 +1,15 @@
 # server.py
+import asyncio
 import os
 import sys
 import tempfile
 import logging
 import importlib
 import json
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Iterator
 
 import httpx
 from pydantic import BaseModel
@@ -29,12 +32,48 @@ from blackbox_predictor_gpt5 import (
 _root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _root not in sys.path:
     sys.path.insert(0, _root)
+
+_log_level_name = os.getenv("JUDGEAI_LOG_LEVEL", "WARNING").upper()
+_log_level = getattr(logging, _log_level_name, logging.WARNING)
+
 if not logging.getLogger().handlers:
     logging.basicConfig(
-        level=logging.INFO,
+        level=_log_level,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
 logger = logging.getLogger("backend_server")
+logger.setLevel(_log_level)
+
+
+def _format_log_fields(fields: dict) -> str:
+    if not fields:
+        return ""
+    return " " + " ".join(f"{k}={v}" for k, v in fields.items())
+
+
+@contextmanager
+def timed_section(section: str, **fields) -> Iterator[None]:
+    start = time.perf_counter()
+    logger.info("[timing] ENTER section=%s%s", section, _format_log_fields(fields))
+    try:
+        yield
+    except Exception:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        logger.exception(
+            "[timing] FAIL section=%s elapsed_ms=%.1f%s",
+            section,
+            elapsed_ms,
+            _format_log_fields(fields),
+        )
+        raise
+    else:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        logger.info(
+            "[timing] EXIT section=%s elapsed_ms=%.1f%s",
+            section,
+            elapsed_ms,
+            _format_log_fields(fields),
+        )
 
 
 PROMPT_TEMPLATE = """
@@ -159,13 +198,29 @@ def health():
 # -------------------------
 @app.post("/api/judge")
 async def judge_case(
-    files: List[UploadFile] = File(...),
+    files: Optional[List[UploadFile]] = File(default=None),
+    case_addendum_file: Optional[UploadFile] = File(default=None),
+    related_files: Optional[List[UploadFile]] = File(default=None),
     redact: bool = Form(False),
     x_judgeai_passcode: str | None = Header(default=None),
 ):
+    request_id = os.urandom(4).hex()
+    request_start = time.perf_counter()
+    all_files: List[UploadFile] = []
+    if files:
+        all_files.extend(files)
+    if case_addendum_file:
+        all_files.append(case_addendum_file)
+    if related_files:
+        all_files.extend(related_files)
+
     logger.info(
-        "[judge] Request received: files=%d redact=%s",
+        "[judge] Request received: request_id=%s files=%d (legacy=%d addendum=%d related=%d) redact=%s",
+        request_id,
+        len(all_files),
         len(files) if files else 0,
+        1 if case_addendum_file else 0,
+        len(related_files) if related_files else 0,
         redact,
     )
     '''
@@ -177,36 +232,50 @@ async def judge_case(
     uploads: List[Tuple[str, bytes]] = []
     tmp_paths: List[str] = []
     try:
-        if not files:
+        if not all_files:
             logger.warning("[judge] No files uploaded.")
             return {"error": "No files uploaded."}
 
-        for uf in files:
-            name = uf.filename or "uploaded.pdf"
-            ext = os.path.splitext(name)[1].lower()
-            if ext != ".pdf":
-                logger.warning(
-                    "[judge] Rejected non-pdf upload: filename=%s ext=%s",
+        with timed_section(
+            "judge.upload_parse_and_stage",
+            request_id=request_id,
+            num_files=len(all_files),
+        ):
+            for uf in all_files:
+                name = uf.filename or "uploaded.pdf"
+                ext = os.path.splitext(name)[1].lower()
+                if ext != ".pdf":
+                    logger.warning(
+                        "[judge] Rejected non-pdf upload: filename=%s ext=%s",
+                        name,
+                        ext,
+                    )
+                    return {"error": f"Only PDFs supported right now. Got: {name}"}
+                with timed_section(
+                    "judge.upload_read_single_file",
+                    request_id=request_id,
+                    filename=name,
+                ):
+                    pdf_bytes = await uf.read()
+                uploads.append((name, pdf_bytes))
+                logger.info(
+                    "[judge] Parsed upload: filename=%s bytes=%d",
                     name,
-                    ext,
+                    len(pdf_bytes),
                 )
-                return {"error": f"Only PDFs supported right now. Got: {name}"}
-            pdf_bytes = await uf.read()
-            uploads.append((name, pdf_bytes))
-            logger.info(
-                "[judge] Parsed upload: filename=%s bytes=%d",
-                name,
-                len(pdf_bytes),
-            )
 
-            fd, path = tempfile.mkstemp(suffix=".pdf")
-            os.close(fd)
+                with timed_section(
+                    "judge.write_temp_file_single",
+                    request_id=request_id,
+                    filename=name,
+                ):
+                    fd, path = tempfile.mkstemp(suffix=".pdf")
+                    os.close(fd)
+                    with open(path, "wb") as out:
+                        out.write(pdf_bytes)
 
-            with open(path, "wb") as out:
-                out.write(pdf_bytes)
-
-            tmp_paths.append(path)
-            logger.info("[judge] Wrote temp file: %s", path)
+                tmp_paths.append(path)
+                logger.info("[judge] Wrote temp file: %s", path)
 
         retrieval_k = int(os.getenv("RETRIEVAL_TOP_K", "3"))
         retrieval_error = None
@@ -218,10 +287,16 @@ async def judge_case(
         )
 
         try:
-            top_k_retrieval = get_top_k_retrieval_for_uploaded_pdfs(
-                uploads=uploads,
-                k=retrieval_k,
-            )
+            with timed_section(
+                "judge.retrieval_top_k",
+                request_id=request_id,
+                retrieval_k=retrieval_k,
+                upload_count=len(uploads),
+            ):
+                top_k_retrieval = get_top_k_retrieval_for_uploaded_pdfs(
+                    uploads=uploads,
+                    k=retrieval_k,
+                )
             logger.info(
                 "[judge] Retrieval complete: retrieved_cases=%d",
                 len(top_k_retrieval.get("retrieved_cases", [])),
@@ -233,11 +308,16 @@ async def judge_case(
         similar_cases = top_k_retrieval.get("retrieved_cases", [])
         query_signals = top_k_retrieval.get("query_signals", {})
 
-        prompt = PROMPT_TEMPLATE.format(
+        with timed_section(
+            "judge.prompt_preparation",
+            request_id=request_id,
             num_docs=len(tmp_paths),
-            retrieval_k=retrieval_k,
-        )
-        model = os.getenv("OPENAI_MODEL", "gpt-5")
+        ):
+            prompt = PROMPT_TEMPLATE.format(
+                num_docs=len(tmp_paths),
+                retrieval_k=retrieval_k,
+            )
+            model = os.getenv("OPENAI_MODEL", "gpt-5")
         logger.info(
             "[judge] Prepared model request: model=%s num_docs=%d retrieval_cases=%d",
             model,
@@ -245,64 +325,132 @@ async def judge_case(
             len(similar_cases),
         )
 
-        logger.info("[judge] Calling run_prediction_with_uploaded_pdfs")
-        raw = run_prediction_with_uploaded_pdfs(
-            tmp_paths,
-            prompt,
-            top_k_retrieval=top_k_retrieval,
-            model=model,
+        extracted_query_signals = (
+            json.dumps(query_signals, indent=2)
+            if isinstance(query_signals, dict) and query_signals
+            else "No extracted query signals were provided for this case."
         )
-        logger.info("[judge] Model call completed: raw_chars=%d", len(raw or ""))
+        prompt_2 = PROMPT_2_TEMPLATE.format(
+            num_docs=len(tmp_paths),
+            extracted_query_signals=extracted_query_signals,
+            standard_of_review=STANDARD_OF_REVIEW_PLACEHOLDER,
+        )
 
-        logger.info("[judge] Parsing model response sections")
-        case_summary, case_decision = parse_gpt_response(raw)
-        logger.info(
-            "[judge] Parsed model response: has_case_summary=%s has_case_decision=%s",
-            bool(case_summary),
-            bool(case_decision),
-        )
+        def _run_case_outcome_call():
+            with timed_section(
+                "judge.case_outcome_thread_total",
+                request_id=request_id,
+                model=model,
+            ):
+                with timed_section(
+                    "judge.case_outcome_model_call",
+                    request_id=request_id,
+                    model=model,
+                ):
+                    raw_local = run_prediction_with_uploaded_pdfs(
+                        tmp_paths,
+                        prompt,
+                        top_k_retrieval=top_k_retrieval,
+                        extracted_brief_texts=top_k_retrieval.get("uploaded_brief_texts"),
+                        model=model,
+                    )
+                logger.info("[judge] Model call completed: raw_chars=%d", len(raw_local or ""))
+                with timed_section("judge.case_outcome_parse_response", request_id=request_id):
+                    case_summary_local, case_decision_local = parse_gpt_response(raw_local)
+                logger.info(
+                    "[judge] Parsed model response: has_case_summary=%s has_case_decision=%s",
+                    bool(case_summary_local),
+                    bool(case_decision_local),
+                )
+                return {
+                    "raw": raw_local,
+                    "case_summary": case_summary_local,
+                    "case_decision": case_decision_local,
+                    "case_error": None,
+                }
+
+        def _run_oral_argument_call():
+            with timed_section(
+                "judge.oral_argument_thread_total",
+                request_id=request_id,
+                model=model,
+            ):
+                with timed_section(
+                    "judge.oral_argument_model_call",
+                    request_id=request_id,
+                    model=model,
+                ):
+                    oral_argument_raw_local = call_gpt_with_content(
+                        prompt=prompt_2,
+                        pdf_files=[Path(p) for p in tmp_paths],
+                        combined_content="__FILE_UPLOAD__",
+                        conv_to_text=False,
+                    )
+                with timed_section(
+                    "judge.oral_argument_parse_response",
+                    request_id=request_id,
+                ):
+                    oral_argument_per_side_local, oral_argument_summary_local = parse_response(
+                        oral_argument_raw_local,
+                        "===ORAL ARGUMENT PER SIDE===",
+                        "===CASE SUMMARY===",
+                    )
+                logger.info(
+                    "[judge] Parsed oral argument response: has_duration=%s has_justification=%s",
+                    bool(oral_argument_per_side_local),
+                    bool(oral_argument_summary_local),
+                )
+                return {
+                    "oral_argument_raw": oral_argument_raw_local,
+                    "oral_argument_prediction": oral_argument_per_side_local,
+                    "oral_argument_summary": oral_argument_summary_local,
+                    "oral_argument_error": None,
+                }
+
+        with timed_section(
+            "judge.parallel_model_tasks_gather",
+            request_id=request_id,
+            task_count=2,
+        ):
+            outcome_task = asyncio.to_thread(_run_case_outcome_call)
+            oral_argument_task = asyncio.to_thread(_run_oral_argument_call)
+            outcome_result, oral_argument_result = await asyncio.gather(
+                outcome_task,
+                oral_argument_task,
+                return_exceptions=True,
+            )
+
+        raw = None
+        case_summary = None
+        case_decision = None
+        case_error = None
 
         oral_argument_raw = None
         oral_argument_per_side = None
         oral_argument_summary = None
         oral_argument_error = None
 
-        try:
-            extracted_query_signals = (
-                json.dumps(query_signals, indent=2)
-                if isinstance(query_signals, dict) and query_signals
-                else "No extracted query signals were provided for this case."
-            )
-            prompt_2 = PROMPT_2_TEMPLATE.format(
-                num_docs=len(tmp_paths),
-                extracted_query_signals=extracted_query_signals,
-                standard_of_review=STANDARD_OF_REVIEW_PLACEHOLDER,
-            )
-            logger.info("[judge] Calling call_gpt_with_content for oral argument prediction")
-            oral_argument_raw = call_gpt_with_content(
-                prompt=prompt_2,
-                pdf_files=[Path(p) for p in tmp_paths],
-                combined_content="__FILE_UPLOAD__",
-                conv_to_text=False,
-            )
-            oral_argument_per_side, oral_argument_summary = parse_response(
-                oral_argument_raw,
-                "===ORAL ARGUMENT PER SIDE===",
-                "===CASE SUMMARY===",
-            )
-            logger.info(
-                "[judge] Parsed oral argument response: has_duration=%s has_justification=%s",
-                bool(oral_argument_per_side),
-                bool(oral_argument_summary),
-            )
-        except Exception as e:
-            oral_argument_error = f"{type(e).__name__}: {str(e)}"
+        if isinstance(outcome_result, Exception):
+            case_error = f"{type(outcome_result).__name__}: {str(outcome_result)}"
+            logger.exception("[judge] Case outcome prediction failed")
+        else:
+            raw = outcome_result.get("raw")
+            case_summary = outcome_result.get("case_summary")
+            case_decision = outcome_result.get("case_decision")
+
+        if isinstance(oral_argument_result, Exception):
+            oral_argument_error = f"{type(oral_argument_result).__name__}: {str(oral_argument_result)}"
             logger.exception("[judge] Oral argument prediction failed")
+        else:
+            oral_argument_raw = oral_argument_result.get("oral_argument_raw")
+            oral_argument_per_side = oral_argument_result.get("oral_argument_prediction")
+            oral_argument_summary = oral_argument_result.get("oral_argument_summary")
 
         return {
             "raw": raw,
             "case_summary": case_summary,
             "case_decision": case_decision,
+            "case_error": case_error,
             "oral_argument_raw": oral_argument_raw,
             "oral_argument_prediction": oral_argument_per_side,
             "oral_argument_summary": oral_argument_summary,
@@ -322,13 +470,19 @@ async def judge_case(
 
     finally:
         logger.info("[judge] Cleaning up temp files: count=%d", len(tmp_paths))
-        for p in tmp_paths:
-            try:
-                os.remove(p)
-            except Exception:
-                logger.warning("[judge] Failed to delete temp file: %s", p)
-                pass
-        logger.info("[judge] Request complete")
+        with timed_section("judge.temp_file_cleanup", request_id=request_id, file_count=len(tmp_paths)):
+            for p in tmp_paths:
+                try:
+                    os.remove(p)
+                except Exception:
+                    logger.warning("[judge] Failed to delete temp file: %s", p)
+                    pass
+        total_elapsed_ms = (time.perf_counter() - request_start) * 1000.0
+        logger.info(
+            "[judge] Request complete: request_id=%s total_elapsed_ms=%.1f",
+            request_id,
+            total_elapsed_ms,
+        )
 
 
 # -------------------------
@@ -394,8 +548,11 @@ async def judge_from_storage(
     req: JudgeFromStorageRequest,
     x_judgeai_passcode: str | None = Header(default=None),
 ):
+    request_id = os.urandom(4).hex()
+    request_start = time.perf_counter()
     logger.info(
-        "[judge-from-storage] Request received: paths=%d redact=%s cleanup=%s",
+        "[judge-from-storage] Request received: request_id=%s paths=%d redact=%s cleanup=%s",
+        request_id,
         len(req.paths) if req.paths else 0,
         req.redact,
         req.cleanup,
@@ -417,48 +574,75 @@ async def judge_from_storage(
 
     try:
         # Download each PDF using signed download URLs
-        for path in req.paths:
-            logger.info("[judge-from-storage] Creating signed URL for: %s", path)
-            signed = supabase.storage.from_(SUPABASE_BUCKET).create_signed_url(path, 60 * 15)
-            data = getattr(signed, "data", None) if not isinstance(signed, dict) else signed.get("data")
+        with timed_section(
+            "judge_from_storage.download_and_stage_uploads",
+            request_id=request_id,
+            path_count=len(req.paths),
+        ):
+            for path in req.paths:
+                with timed_section(
+                    "judge_from_storage.create_signed_url",
+                    request_id=request_id,
+                    path=path,
+                ):
+                    logger.info("[judge-from-storage] Creating signed URL for: %s", path)
+                    signed = supabase.storage.from_(SUPABASE_BUCKET).create_signed_url(path, 60 * 15)
+                    data = getattr(signed, "data", None) if not isinstance(signed, dict) else signed.get("data")
 
-            # supabase might return "signedURL" or "signedUrl" depending on lib version
-            url = None
-            if data:
-                url = data.get("signedURL") or data.get("signedUrl") or data.get("signed_url")
+                    # supabase might return "signedURL" or "signedUrl" depending on lib version
+                    url = None
+                    if data:
+                        url = data.get("signedURL") or data.get("signedUrl") or data.get("signed_url")
 
-            if not url:
-                logger.error("[judge-from-storage] Could not create signed URL for: %s", path)
-                return {"error": f"Failed to create signed download URL for {path}"}
+                    if not url:
+                        logger.error("[judge-from-storage] Could not create signed URL for: %s", path)
+                        return {"error": f"Failed to create signed download URL for {path}"}
 
-            logger.info("[judge-from-storage] Downloading file from signed URL")
-            r = await client.get(url)
-            r.raise_for_status()
-            logger.info(
-                "[judge-from-storage] Download complete: path=%s bytes=%d",
-                path,
-                len(r.content),
-            )
+                with timed_section(
+                    "judge_from_storage.download_single_file",
+                    request_id=request_id,
+                    path=path,
+                ):
+                    logger.info("[judge-from-storage] Downloading file from signed URL")
+                    r = await client.get(url)
+                    r.raise_for_status()
+                    logger.info(
+                        "[judge-from-storage] Download complete: path=%s bytes=%d",
+                        path,
+                        len(r.content),
+                    )
 
-            fd, local_path = tempfile.mkstemp(suffix=".pdf")
-            os.close(fd)
-            with open(local_path, "wb") as out:
-                out.write(r.content)
+                with timed_section(
+                    "judge_from_storage.write_temp_file_single",
+                    request_id=request_id,
+                    path=path,
+                ):
+                    fd, local_path = tempfile.mkstemp(suffix=".pdf")
+                    os.close(fd)
+                    with open(local_path, "wb") as out:
+                        out.write(r.content)
 
-            tmp_paths.append(local_path)
-            logger.info("[judge-from-storage] Wrote temp file: %s", local_path)
+                tmp_paths.append(local_path)
+                logger.info("[judge-from-storage] Wrote temp file: %s", local_path)
 
-        prompt = PROMPT_TEMPLATE.format(num_docs=len(tmp_paths))
-        model = os.getenv("OPENAI_MODEL", "gpt-5")
+        with timed_section(
+            "judge_from_storage.prompt_preparation",
+            request_id=request_id,
+            num_docs=len(tmp_paths),
+        ):
+            prompt = PROMPT_TEMPLATE.format(num_docs=len(tmp_paths))
+            model = os.getenv("OPENAI_MODEL", "gpt-5")
         logger.info(
             "[judge-from-storage] Calling model: model=%s num_docs=%d",
             model,
             len(tmp_paths),
         )
 
-        raw = run_prediction_with_uploaded_pdfs(tmp_paths, prompt, model=model)
+        with timed_section("judge_from_storage.model_call", request_id=request_id, model=model):
+            raw = run_prediction_with_uploaded_pdfs(tmp_paths, prompt, model=model)
         logger.info("[judge-from-storage] Model call completed: raw_chars=%d", len(raw or ""))
-        case_summary, case_decision = parse_gpt_response(raw)
+        with timed_section("judge_from_storage.parse_response", request_id=request_id):
+            case_summary, case_decision = parse_gpt_response(raw)
         logger.info(
             "[judge-from-storage] Parsed response: has_case_summary=%s has_case_decision=%s",
             bool(case_summary),
@@ -467,15 +651,20 @@ async def judge_from_storage(
 
         # Optional cleanup: delete stored objects after processing
         if req.cleanup:
-            logger.info(
-                "[judge-from-storage] Cleaning up storage objects: count=%d",
-                len(req.paths),
-            )
-            try:
-                supabase.storage.from_(SUPABASE_BUCKET).remove(req.paths)
-            except Exception:
-                logger.warning("[judge-from-storage] Failed to clean up storage objects")
-                pass
+            with timed_section(
+                "judge_from_storage.cleanup_storage_objects",
+                request_id=request_id,
+                path_count=len(req.paths),
+            ):
+                logger.info(
+                    "[judge-from-storage] Cleaning up storage objects: count=%d",
+                    len(req.paths),
+                )
+                try:
+                    supabase.storage.from_(SUPABASE_BUCKET).remove(req.paths)
+                except Exception:
+                    logger.warning("[judge-from-storage] Failed to clean up storage objects")
+                    pass
 
         return {
             "raw": raw,
@@ -493,10 +682,20 @@ async def judge_from_storage(
     finally:
         logger.info("[judge-from-storage] Cleaning up temp files: count=%d", len(tmp_paths))
         await client.aclose()
-        for p in tmp_paths:
-            try:
-                os.remove(p)
-            except Exception:
-                logger.warning("[judge-from-storage] Failed to delete temp file: %s", p)
-                pass
-        logger.info("[judge-from-storage] Request complete")
+        with timed_section(
+            "judge_from_storage.temp_file_cleanup",
+            request_id=request_id,
+            file_count=len(tmp_paths),
+        ):
+            for p in tmp_paths:
+                try:
+                    os.remove(p)
+                except Exception:
+                    logger.warning("[judge-from-storage] Failed to delete temp file: %s", p)
+                    pass
+        total_elapsed_ms = (time.perf_counter() - request_start) * 1000.0
+        logger.info(
+            "[judge-from-storage] Request complete: request_id=%s total_elapsed_ms=%.1f",
+            request_id,
+            total_elapsed_ms,
+        )

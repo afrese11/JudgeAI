@@ -749,17 +749,18 @@ def retrieve_top_k_case_cards(
         )
 
     # ── Step 7: Emit structured retrieval log ──
-    retrieval_log = _build_retrieval_log(
-        cfg=cfg,
-        query_signals=query_signals,
-        pre_gate_ranked=pre_gate_ranked,
-        gated_out=gated_out,
-        top_ids=top_ids,
-        final_scores=final_scores,
-        breakdowns=breakdowns,
-        candidate_types=candidate_types,
-    )
-    logger.info(json.dumps(retrieval_log))
+    if logger.isEnabledFor(logging.INFO):
+        retrieval_log = _build_retrieval_log(
+            cfg=cfg,
+            query_signals=query_signals,
+            pre_gate_ranked=pre_gate_ranked,
+            gated_out=gated_out,
+            top_ids=top_ids,
+            final_scores=final_scores,
+            breakdowns=breakdowns,
+            candidate_types=candidate_types,
+        )
+        logger.info(json.dumps(retrieval_log))
     logger.info(
         "[retrieve_top_k_case_cards] complete results_count=%d",
         len(results),
@@ -993,11 +994,17 @@ def retrieve_similar_cases_for_new_case(
         len(signals.issue_tags),
     )
     fingerprint = build_query_fingerprint(briefs, query_signals=signals)
-    logger.info(
-        "[retrieve_similar_cases_for_new_case] fingerprint chars=%d preview=%s",
-        len(fingerprint),
-        _preview(fingerprint),
-    )
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(
+            "[retrieve_similar_cases_for_new_case] fingerprint chars=%d preview=%s",
+            len(fingerprint),
+            _preview(fingerprint),
+        )
+    else:
+        logger.debug(
+            "[retrieve_similar_cases_for_new_case] fingerprint chars=%d",
+            len(fingerprint),
+        )
     embedding = embed_text_openai(fingerprint)
     logger.info(
         "[retrieve_similar_cases_for_new_case] embedding size=%d",
@@ -1053,7 +1060,13 @@ def retrieve_similar_cases_from_pdf_uploads(
     candidate_chunks: int = DEFAULT_CANDIDATE_CHUNKS,
     config: Optional[RetrievalConfig] = None,
     return_query_signals: bool = False,
-) -> List[RetrievedCaseCard] | Tuple[List[RetrievedCaseCard], QuerySignals]:
+    return_extracted_texts: bool = False,
+) -> (
+    List[RetrievedCaseCard]
+    | Tuple[List[RetrievedCaseCard], QuerySignals]
+    | Tuple[List[RetrievedCaseCard], List[Dict[str, str]]]
+    | Tuple[List[RetrievedCaseCard], QuerySignals, List[Dict[str, str]]]
+):
     """
     Version of retrieve_similar_cases_for_new_case for frontend PDF uploads
     (e.g. drag-and-drop). Accepts a list of (label, pdf_bytes) pairs; each
@@ -1071,10 +1084,17 @@ def retrieve_similar_cases_from_pdf_uploads(
     """
     if not uploads:
         logger.warning("[retrieve_similar_cases_from_pdf_uploads] No uploads provided; returning [].")
-        return ([], QuerySignals()) if return_query_signals else []
+        if return_query_signals and return_extracted_texts:
+            return [], QuerySignals(), []
+        if return_query_signals:
+            return [], QuerySignals()
+        if return_extracted_texts:
+            return [], []
+        return []
 
     url = db_url or DATABASE_URL
     briefs: List[BriefInput] = []
+    extracted_texts: List[Dict[str, str]] = []
     logger.info(
         "[retrieve_similar_cases_from_pdf_uploads] start uploads=%d requested_k=%d candidate_chunks=%d",
         len(uploads),
@@ -1087,13 +1107,22 @@ def retrieve_similar_cases_from_pdf_uploads(
         if name.lower().endswith(".pdf"):
             name = name[:-4].strip() or "brief"
         briefs.append(BriefInput(label=name, text=text))
-        logger.info(
-            "[retrieve_similar_cases_from_pdf_uploads] extracted text label=%s pdf_bytes=%d text_chars=%d text_preview=%s",
-            name,
-            len(pdf_bytes or b""),
-            len(text),
-            _preview(text),
-        )
+        extracted_texts.append({"label": name, "text": text})
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "[retrieve_similar_cases_from_pdf_uploads] extracted text label=%s pdf_bytes=%d text_chars=%d text_preview=%s",
+                name,
+                len(pdf_bytes or b""),
+                len(text),
+                _preview(text),
+            )
+        else:
+            logger.debug(
+                "[retrieve_similar_cases_from_pdf_uploads] extracted text label=%s pdf_bytes=%d text_chars=%d",
+                name,
+                len(pdf_bytes or b""),
+                len(text),
+            )
 
     # Extract metadata from briefs via LLM so Doctrine/Statute/Posture scores can be computed
     combined_text = "\n\n".join(b.text for b in briefs)[:50_000]
@@ -1125,8 +1154,12 @@ def retrieve_similar_cases_from_pdf_uploads(
         len(results),
         [r.case_id for r in results],
     )
+    if return_query_signals and return_extracted_texts:
+        return results, signals, extracted_texts
     if return_query_signals:
         return results, signals
+    if return_extracted_texts:
+        return results, extracted_texts
     return results
 
 

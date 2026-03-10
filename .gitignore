@@ -18,3 +18,4 @@ philoai
 
 __pycache__/
 *.pyc
+rag_db.backup

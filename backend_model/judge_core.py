@@ -1,9 +1,13 @@
 # judge_core.py
 import os
 import sys
+import time
+import logging
+import threading
 from dataclasses import asdict
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Iterator, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -32,6 +36,61 @@ if not _api_key:
         "Set OPENAI_API_KEY or FINN_API_KEY in .env (e.g. backend_model/.env or project root .env)"
     )
 client = OpenAI(api_key=_api_key)
+logger = logging.getLogger("judge_core")
+
+
+def _delete_uploaded_openai_files_background(uploaded_file_ids: List[str]) -> None:
+    """Best-effort asynchronous cleanup of uploaded OpenAI files."""
+    if not uploaded_file_ids:
+        return
+
+    def _worker(file_ids: List[str]) -> None:
+        with timed_section(
+            "judge_core.delete_uploaded_openai_files_async",
+            uploaded_file_count=len(file_ids),
+        ):
+            for fid in file_ids:
+                try:
+                    client.files.delete(fid)
+                except Exception:
+                    logger.warning("[cleanup] Failed to delete uploaded OpenAI file: %s", fid)
+
+    threading.Thread(
+        target=_worker,
+        args=(list(uploaded_file_ids),),
+        daemon=True,
+    ).start()
+
+
+def _format_log_fields(fields: dict) -> str:
+    if not fields:
+        return ""
+    return " " + " ".join(f"{k}={v}" for k, v in fields.items())
+
+
+@contextmanager
+def timed_section(section: str, **fields) -> Iterator[None]:
+    start = time.perf_counter()
+    logger.info("[timing] ENTER section=%s%s", section, _format_log_fields(fields))
+    try:
+        yield
+    except Exception:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        logger.exception(
+            "[timing] FAIL section=%s elapsed_ms=%.1f%s",
+            section,
+            elapsed_ms,
+            _format_log_fields(fields),
+        )
+        raise
+    else:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        logger.info(
+            "[timing] EXIT section=%s elapsed_ms=%.1f%s",
+            section,
+            elapsed_ms,
+            _format_log_fields(fields),
+        )
 
 
 def parse_top_k_retrieval_dict_to_prompt_context(top_k_retrieval: Dict[str, Any] | None) -> str:
@@ -225,35 +284,46 @@ def get_top_k_retrieval_for_uploaded_pdfs(
     if candidate_chunks is not None:
         kwargs["candidate_chunks"] = candidate_chunks
 
-    cards, query_signals = retrieve_similar_cases_from_pdf_uploads(
-        uploads,
-        return_query_signals=True,
-        **kwargs,
-    )
+    with timed_section(
+        "judge_core.retrieve_similar_cases_from_pdf_uploads",
+        k=k,
+        upload_count=len(uploads),
+    ):
+        cards, query_signals, uploaded_brief_texts = retrieve_similar_cases_from_pdf_uploads(
+            uploads,
+            return_query_signals=True,
+            return_extracted_texts=True,
+            **kwargs,
+        )
 
     retrieved_cases: List[Dict[str, Any]] = []
-    for card in cards:
-        full_text = (card.case_card_text or "").strip()
-        main_part, _ = _split_case_card_main_and_addendum(full_text)
-        summary = main_part if main_part else full_text
+    with timed_section(
+        "judge_core.serialize_retrieved_cards",
+        retrieved_count=len(cards),
+    ):
+        for card in cards:
+            full_text = (card.case_card_text or "").strip()
+            main_part, _ = _split_case_card_main_and_addendum(full_text)
+            summary = main_part if main_part else full_text
 
-        entry: Dict[str, Any] = {
-            "case_id": card.case_id,
-            "score": card.score,
-            "case_type": card.case_type,
-            "issue_tags": card.issue_tags,
-            "statute_tags": card.statute_tags,
-            "doctrine_tags": card.doctrine_tags,
-            "procedural_posture": card.procedural_posture,
-            "score_breakdown": asdict(card.score_breakdown) if card.score_breakdown else None,
-            "summary": summary,
-            "case_card_text": full_text,
-        }
-        retrieved_cases.append(entry)
+            entry: Dict[str, Any] = {
+                "case_id": card.case_id,
+                "score": card.score,
+                "case_type": card.case_type,
+                "issue_tags": card.issue_tags,
+                "statute_tags": card.statute_tags,
+                "doctrine_tags": card.doctrine_tags,
+                "procedural_posture": card.procedural_posture,
+                "score_breakdown": asdict(card.score_breakdown) if card.score_breakdown else None,
+                "summary": summary,
+                "case_card_text": full_text,
+            }
+            retrieved_cases.append(entry)
 
     return {
         "query_signals": asdict(query_signals),
         "retrieved_cases": retrieved_cases,
+        "uploaded_brief_texts": uploaded_brief_texts,
     }
 
 
@@ -261,63 +331,83 @@ def run_prediction_with_uploaded_pdfs(
     pdf_paths: List[str],
     prompt_text: str,
     top_k_retrieval: Dict[str, Any] | None = None,
+    extracted_brief_texts: Optional[List[Dict[str, str]]] = None,
     model: str | None = None,
 ) -> str:
     """
-    Upload PDFs, call the Responses API with file inputs, return output text.
+    Call Chat Completions with either extracted document text (preferred)
+    or uploaded PDF files as fallback; return output text.
     """
     model = model or os.getenv("OPENAI_MODEL", "gpt-5")
-    final_prompt_text = build_prediction_prompt_with_retrieval_context(
-        prompt_text=prompt_text,
-        top_k_retrieval=top_k_retrieval,
-    )
+    with timed_section(
+        "judge_core.build_prediction_prompt_with_retrieval_context",
+        model=model,
+        pdf_count=len(pdf_paths),
+    ):
+        final_prompt_text = build_prediction_prompt_with_retrieval_context(
+            prompt_text=prompt_text,
+            top_k_retrieval=top_k_retrieval,
+        )
 
     uploaded_file_ids: List[str] = []
     file_handles = []
 
     try:
-        # Upload PDFs (recommended purpose for model inputs is "user_data")
+        if extracted_brief_texts:
+            doc_sections: List[str] = []
+            for idx, item in enumerate(extracted_brief_texts, start=1):
+                label = (item or {}).get("label") or f"document_{idx}"
+                text = ((item or {}).get("text") or "").strip()
+                if not text:
+                    continue
+                doc_sections.append(
+                    f"{'='*60}\nDOCUMENT: {label}\n{'='*60}\n\n{text}"
+                )
+            combined_docs = "\n\n".join(doc_sections) if doc_sections else "No extracted document text available."
+            user_text = f"{final_prompt_text}\n\n===UPLOADED_DOCUMENT_TEXT===\n{combined_docs}"
+            with timed_section(
+                "judge_core.openai_chat_completions_create_text",
+                model=model,
+                extracted_doc_count=len(doc_sections),
+            ):
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": user_text}],
+                )
+            return response.choices[0].message.content or ""
+
+        # Fallback path: upload PDFs and call Chat Completions with file inputs.
         for path in pdf_paths:
-            fh = open(path, "rb")
-            file_handles.append(fh)
+            with timed_section("judge_core.open_pdf_for_upload", path=path):
+                fh = open(path, "rb")
+                file_handles.append(fh)
+            with timed_section("judge_core.openai_file_upload", path=path, model=model):
+                uploaded = client.files.create(file=fh, purpose="user_data")
+                uploaded_file_ids.append(uploaded.id)
 
-            uploaded = client.files.create(
-                file=fh,
-                purpose="user_data",
-            )
-            uploaded_file_ids.append(uploaded.id)
-
-        # Build Responses API input with multiple files + your prompt text.
-        # (For PDF inputs, Responses API is the recommended path.) :contentReference[oaicite:1]{index=1}
-        content = []
+        content: List[Dict[str, Any]] = [{"type": "text", "text": final_prompt_text}]
         for fid in uploaded_file_ids:
-            content.append({"type": "input_file", "file_id": fid})
-        content.append({"type": "input_text", "text": final_prompt_text})
+            content.append({"type": "file", "file": {"file_id": fid}})
 
-        response = client.responses.create(
+        with timed_section(
+            "judge_core.openai_chat_completions_create_files",
             model=model,
-            input=[
-                {
-                    "role": "user",
-                    "content": content,
-                }
-            ],
-        )
-
-        # The docs show using response.output_text for Responses API output. :contentReference[oaicite:2]{index=2}
-        return response.output_text or ""
+            uploaded_file_count=len(uploaded_file_ids),
+        ):
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": content}],
+            )
+        return response.choices[0].message.content or ""
 
     finally:
         # Close local file handles
-        for fh in file_handles:
-            try:
-                fh.close()
-            except Exception:
-                pass
+        with timed_section("judge_core.close_local_file_handles", file_handle_count=len(file_handles)):
+            for fh in file_handles:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
 
-        # Best-effort cleanup: delete uploaded OpenAI files
-        for fid in uploaded_file_ids:
-            try:
-                client.files.delete(fid)
-            except Exception:
-                pass
+        # Best-effort cleanup in background so it does not block request completion.
+        _delete_uploaded_openai_files_background(uploaded_file_ids)
