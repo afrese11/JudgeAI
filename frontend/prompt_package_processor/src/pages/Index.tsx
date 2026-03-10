@@ -1,10 +1,21 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { FileDropZone } from '@/components/FileDropZone';
 import { OutputDisplay } from '@/components/OutputDisplay';
 import { Sparkles, ShieldCheck } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { submitJudgeCase, type JudgeCaseResponse } from '@/lib/api';
+import { isSupabaseConfigured, supabase } from '@/lib/supabase';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Input } from '@/components/ui/input';
+import type { Session } from '@supabase/supabase-js';
+
+const ALLOWED_SIGNUP_EMAILS = new Set([
+  'david.schwartz@law.northwestern.edu',
+  'andrewfrese2027@u.northwestern.edu',
+  'nikola.datzov@und.edu',
+  'muhammadrozaidi2026@u.northwestern.edu',
+  'finnmcm@u.northwestern.edu',
+]);
 
 const Index = () => {
   const [files, setFiles] = useState<File[]>([]);
@@ -12,6 +23,11 @@ const Index = () => {
   const [error, setError] = useState<string | null>(null);
   const [redact, setRedact] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [session, setSession] = useState<Session | null>(null);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
+  const [isAuthSubmitting, setIsAuthSubmitting] = useState(false);
 
   const apiBase = useMemo(() => {
     const envBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
@@ -29,9 +45,103 @@ const Index = () => {
     setError(message);
   };
 
+  useEffect(() => {
+    if (!isSupabaseConfigured || !supabase) {
+      return;
+    }
+    void supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session ?? null);
+    });
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
+    });
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  const validateAuthInputs = (): boolean => {
+    if (!email.trim() || !password.trim()) {
+      setError('Enter both email and password.');
+      return false;
+    }
+    if (password.length < 6) {
+      setError('Password must be at least 6 characters.');
+      return false;
+    }
+    return true;
+  };
+
+  const handleEmailSignIn = async () => {
+    if (!isSupabaseConfigured || !supabase) {
+      setError('Supabase is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.');
+      return;
+    }
+    if (!validateAuthInputs()) {
+      return;
+    }
+    setIsAuthSubmitting(true);
+    setError(null);
+    setAuthNotice(null);
+    const { error: signInError } = await supabase.auth.signInWithPassword({
+      email: email.trim(),
+      password,
+    });
+    if (signInError) {
+      setError(signInError.message);
+    }
+    setIsAuthSubmitting(false);
+  };
+
+  const handleEmailSignUp = async () => {
+    if (!isSupabaseConfigured || !supabase) {
+      setError('Supabase is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.');
+      return;
+    }
+    if (!validateAuthInputs()) {
+      return;
+    }
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!ALLOWED_SIGNUP_EMAILS.has(normalizedEmail)) {
+      setError('This email is not approved for account creation.');
+      return;
+    }
+    setIsAuthSubmitting(true);
+    setError(null);
+    setAuthNotice(null);
+    const { data, error: signUpError } = await supabase.auth.signUp({
+      email: normalizedEmail,
+      password,
+    });
+    if (signUpError) {
+      setError(signUpError.message);
+    } else if (!data.session) {
+      setAuthNotice('Check your email to confirm your account, then sign in.');
+    } else {
+      setAuthNotice('Account created and signed in.');
+    }
+    setIsAuthSubmitting(false);
+  };
+
+  const handleSignOut = async () => {
+    if (!supabase) {
+      return;
+    }
+    const { error: signOutError } = await supabase.auth.signOut();
+    if (signOutError) {
+      setError(signOutError.message);
+    }
+  };
+
   const handleAnalyze = async () => {
     if (files.length === 0) {
       setError('Add at least one PDF brief before running analysis.');
+      return;
+    }
+    if (!session?.access_token || !supabase) {
+      setError('Sign in before analyzing briefs.');
       return;
     }
 
@@ -40,10 +150,22 @@ const Index = () => {
     setResult(null);
 
     try {
+      const {
+        data: { session: latestSession },
+        error: sessionError,
+      } = await supabase.auth.getSession();
+      if (sessionError) {
+        throw new Error(sessionError.message);
+      }
+      if (!latestSession?.access_token) {
+        throw new Error('Your session expired. Sign in again.');
+      }
+
       const response = await submitJudgeCase({
         files,
         redact,
         apiBase,
+        accessToken: latestSession.access_token,
       });
       setResult(response);
     } catch (err: unknown) {
@@ -53,6 +175,8 @@ const Index = () => {
       setIsLoading(false);
     }
   };
+
+  const isAuthenticated = Boolean(session?.user && session.access_token);
 
   return (
     <div className="min-h-screen bg-background">
@@ -65,47 +189,127 @@ const Index = () => {
         </div>
 
         <div className="space-y-6">
-          <FileDropZone
-            files={files}
-            onFilesChange={setFiles}
-            onValidationError={handleValidationError}
-            disabled={isLoading}
-          />
+          {error ? (
+            <Alert variant="destructive">
+              <AlertTitle>Something went wrong</AlertTitle>
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          ) : null}
 
           <Alert>
             <ShieldCheck className="h-4 w-4" />
-            <AlertTitle>Backend note</AlertTitle>
+            <AlertTitle>Authentication</AlertTitle>
             <AlertDescription>
-              This client sends PDFs directly to <code>/api/judge</code>. If your backend has passcode
-              protection enabled, requests will be rejected until passcode support is reintroduced.
+              {isSupabaseConfigured
+                ? session?.user?.email
+                  ? `Signed in as ${session.user.email}.`
+                  : 'Sign in with email and password to call secured backend endpoints.'
+                : 'Supabase auth is not configured in this frontend environment.'}
             </AlertDescription>
           </Alert>
 
-          <div className="flex items-center justify-between rounded-lg border bg-card px-4 py-3">
-            <label htmlFor="redact-toggle" className="text-sm font-medium text-foreground">
-              Redact sensitive details before analysis
-            </label>
-            <input
-              id="redact-toggle"
-              type="checkbox"
-              checked={redact}
-              disabled={isLoading}
-              onChange={(event) => setRedact(event.target.checked)}
-              className="h-4 w-4 accent-primary"
-            />
+          {authNotice ? (
+            <Alert>
+              <AlertTitle>Authentication update</AlertTitle>
+              <AlertDescription>{authNotice}</AlertDescription>
+            </Alert>
+          ) : null}
+
+          <div className="space-y-3">
+            {session?.user ? (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={handleSignOut}
+                disabled={isLoading || isAuthSubmitting}
+              >
+                Sign out
+              </Button>
+            ) : (
+              <>
+                <Input
+                  type="email"
+                  placeholder="Email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  disabled={isLoading || isAuthSubmitting}
+                  autoComplete="email"
+                />
+                <Input
+                  type="password"
+                  placeholder="Password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  disabled={isLoading || isAuthSubmitting}
+                  autoComplete="current-password"
+                />
+                <div className="flex gap-3">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={handleEmailSignIn}
+                    disabled={isLoading || isAuthSubmitting}
+                  >
+                    {isAuthSubmitting ? 'Signing in...' : 'Sign in'}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    onClick={handleEmailSignUp}
+                    disabled={isLoading || isAuthSubmitting}
+                  >
+                    {isAuthSubmitting ? 'Signing up...' : 'Sign up'}
+                  </Button>
+                </div>
+              </>
+            )}
           </div>
 
-          <Button
-            onClick={handleAnalyze}
-            disabled={files.length === 0 || isLoading}
-            className="w-full h-12 text-base font-medium glow-button"
-            size="lg"
-          >
-            <Sparkles className="w-5 h-5 mr-2" />
-            {isLoading ? 'Analyzing briefs...' : 'Analyze Case Briefs'}
-          </Button>
+          {!isAuthenticated ? (
+            <Alert>
+              <AlertTitle>Sign in required</AlertTitle>
+              <AlertDescription>
+                {isSupabaseConfigured
+                  ? 'Authenticate with email and password to continue to case analysis.'
+                  : 'Authentication is unavailable until Supabase environment variables are set.'}
+              </AlertDescription>
+            </Alert>
+          ) : (
+            <>
+              <FileDropZone
+                files={files}
+                onFilesChange={setFiles}
+                onValidationError={handleValidationError}
+                disabled={isLoading}
+              />
 
-          <OutputDisplay result={result} error={error} isLoading={isLoading} />
+              <div className="flex items-center justify-between rounded-lg border bg-card px-4 py-3">
+                <label htmlFor="redact-toggle" className="text-sm font-medium text-foreground">
+                  Redact sensitive details before analysis
+                </label>
+                <input
+                  id="redact-toggle"
+                  type="checkbox"
+                  checked={redact}
+                  disabled={isLoading}
+                  onChange={(event) => setRedact(event.target.checked)}
+                  className="h-4 w-4 accent-primary"
+                />
+              </div>
+
+              <Button
+                onClick={handleAnalyze}
+                disabled={files.length === 0 || isLoading}
+                className="w-full h-12 text-base font-medium glow-button"
+                size="lg"
+              >
+                <Sparkles className="w-5 h-5 mr-2" />
+                {isLoading ? 'Analyzing briefs...' : 'Analyze Case Briefs'}
+              </Button>
+
+              <OutputDisplay result={result} error={error} isLoading={isLoading} />
+            </>
+          )}
         </div>
       </div>
     </div>

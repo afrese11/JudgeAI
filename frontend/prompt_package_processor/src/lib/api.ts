@@ -13,12 +13,14 @@ export interface JudgeCaseResponse {
   redact?: boolean;
   model?: string;
   error?: string;
+  detail?: string | { msg?: string }[] | null;
 }
 
 interface SubmitJudgeCaseParams {
   files: File[];
   redact?: boolean;
   apiBase?: string;
+  accessToken?: string;
 }
 
 const safeApiBase = (apiBase?: string) =>
@@ -28,6 +30,7 @@ export async function submitJudgeCase({
   files,
   redact = false,
   apiBase,
+  accessToken,
 }: SubmitJudgeCaseParams): Promise<JudgeCaseResponse> {
   const endpoint = `${safeApiBase(apiBase)}/api/judge`;
   const form = new FormData();
@@ -39,6 +42,11 @@ export async function submitJudgeCase({
 
   const response = await fetch(endpoint, {
     method: "POST",
+    headers: accessToken
+      ? {
+          Authorization: `Bearer ${accessToken}`,
+        }
+      : undefined,
     body: form,
   });
 
@@ -46,8 +54,20 @@ export async function submitJudgeCase({
     .json()
     .catch(() => ({ error: "Server returned invalid JSON." }));
 
-  if (!response.ok || payload.error) {
-    throw new Error(payload.error || `Request failed (${response.status})`);
+  const errorDetail = (() => {
+    if (payload.error) return payload.error;
+    if (typeof payload.detail === "string") return payload.detail;
+    if (Array.isArray(payload.detail)) {
+      const messages = payload.detail
+        .map((item) => (item && typeof item.msg === "string" ? item.msg : ""))
+        .filter(Boolean);
+      if (messages.length > 0) return messages.join("; ");
+    }
+    return null;
+  })();
+
+  if (!response.ok || errorDetail) {
+    throw new Error(errorDetail || `Request failed (${response.status})`);
   }
 
   return {
