@@ -85,7 +85,7 @@ const getCopyText = (result: JudgeCaseResponse) => {
     result.case_summary ? `Case Summary\n${stripRetrievalBlock(result.case_summary)}` : '',
     result.case_decision ? `Case Decision\n${stripRetrievalBlock(result.case_decision)}` : '',
     result.oral_argument_prediction
-      ? `Oral Argument Prediction\n${result.oral_argument_prediction}`
+      ? `Oral Argument Recommendation\n${result.oral_argument_prediction}`
       : '',
     result.oral_argument_summary
       ? `Oral Argument Justification\n${result.oral_argument_summary}`
