@@ -39,6 +39,32 @@ client = OpenAI(api_key=_api_key)
 logger = logging.getLogger("judge_core")
 
 
+def _condense_document_text(
+    text: str,
+    *,
+    per_doc_limit_chars: int,
+) -> str:
+    """
+    Keep a representative slice of long document text.
+    We preserve both the opening and closing portions because legal briefs often
+    front-load procedural posture and conclude with disposition-focused arguments.
+    """
+    text = (text or "").strip()
+    if per_doc_limit_chars <= 0 or len(text) <= per_doc_limit_chars:
+        return text
+
+    if per_doc_limit_chars < 4000:
+        return text[:per_doc_limit_chars]
+
+    head = int(per_doc_limit_chars * 0.7)
+    tail = per_doc_limit_chars - head
+    return (
+        text[:head]
+        + "\n\n[... document middle omitted for latency control ...]\n\n"
+        + text[-tail:]
+    )
+
+
 def _delete_uploaded_openai_files_background(uploaded_file_ids: List[str]) -> None:
     """Best-effort asynchronous cleanup of uploaded OpenAI files."""
     if not uploaded_file_ids:
@@ -354,17 +380,44 @@ def run_prediction_with_uploaded_pdfs(
 
     try:
         if extracted_brief_texts:
+            per_doc_limit_chars = int(os.getenv("CASE_OUTCOME_DOC_CHAR_LIMIT", "18000"))
+            total_docs_limit_chars = int(os.getenv("CASE_OUTCOME_TOTAL_DOC_CHAR_LIMIT", "90000"))
             doc_sections: List[str] = []
+            total_chars = 0
             for idx, item in enumerate(extracted_brief_texts, start=1):
                 label = (item or {}).get("label") or f"document_{idx}"
                 text = ((item or {}).get("text") or "").strip()
                 if not text:
                     continue
-                doc_sections.append(
-                    f"{'='*60}\nDOCUMENT: {label}\n{'='*60}\n\n{text}"
+                condensed = _condense_document_text(
+                    text,
+                    per_doc_limit_chars=per_doc_limit_chars,
                 )
+                if total_docs_limit_chars > 0 and total_chars >= total_docs_limit_chars:
+                    break
+                if total_docs_limit_chars > 0 and (total_chars + len(condensed)) > total_docs_limit_chars:
+                    remaining = total_docs_limit_chars - total_chars
+                    if remaining <= 0:
+                        break
+                    condensed = _condense_document_text(
+                        condensed,
+                        per_doc_limit_chars=remaining,
+                    )
+                if not condensed:
+                    continue
+                doc_sections.append(
+                    f"{'='*60}\nDOCUMENT: {label}\n{'='*60}\n\n{condensed}"
+                )
+                total_chars += len(condensed)
             combined_docs = "\n\n".join(doc_sections) if doc_sections else "No extracted document text available."
             user_text = f"{final_prompt_text}\n\n===UPLOADED_DOCUMENT_TEXT===\n{combined_docs}"
+            logger.info(
+                "[case_outcome] Prepared condensed extracted docs: sections=%d chars=%d per_doc_limit=%d total_limit=%d",
+                len(doc_sections),
+                len(combined_docs),
+                per_doc_limit_chars,
+                total_docs_limit_chars,
+            )
             with timed_section(
                 "judge_core.openai_chat_completions_create_text",
                 model=model,
