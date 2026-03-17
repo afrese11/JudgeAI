@@ -219,7 +219,7 @@ export const OutputDisplay = ({ result, error, isLoading }: OutputDisplayProps) 
           <CardHeader className="pb-2">
             <CardTitle className="text-base flex items-center gap-2">
               <Clock3 className="w-4 h-4 text-primary" />
-              Oral Argument Prediction
+              Oral Argument Recommendation
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
