@@ -381,7 +381,7 @@ def run_prediction_with_uploaded_pdfs(
     try:
         if extracted_brief_texts:
             per_doc_limit_chars = int(os.getenv("CASE_OUTCOME_DOC_CHAR_LIMIT", "18000"))
-            total_docs_limit_chars = int(os.getenv("CASE_OUTCOME_TOTAL_DOC_CHAR_LIMIT", "90000"))
+            total_docs_limit_chars = int(os.getenv("CASE_OUTCOME_TOTAL_DOC_CHAR_LIMIT", "60000"))
             doc_sections: List[str] = []
             total_chars = 0
             for idx, item in enumerate(extracted_brief_texts, start=1):

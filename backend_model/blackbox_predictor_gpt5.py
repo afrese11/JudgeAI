@@ -9,7 +9,7 @@ from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 import pdfplumber
 
-DEFAULT_MODEL_NAME = "gpt-5.2"
+DEFAULT_MODEL_NAME = "gpt-5"
 MODEL_NAME = DEFAULT_MODEL_NAME
 
 _env_path = Path(__file__).resolve().parent / ".env"
